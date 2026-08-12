@@ -156,6 +156,13 @@ async def search_code(
     items = data.get("items", [])
     total = data.get("total_count", 0)
     if not items:
+        if repo:
+            # 搜索 API 对不存在的 repo qualifier 静默返回 0 结果，用探针区分"仓库不存在"与"无匹配"
+            info = await _get(client, f"{API_BASE}/repos/{repo}", headers=_headers())
+            if info.status_code == 404:
+                return f"搜索失败: 仓库不存在或 token 无权限访问该仓库（{repo}）"
+            if info.status_code != 200:
+                return f"搜索失败: 仓库探测异常: {_api_error(info)}"
         return f"未找到与 '{q}' 相关的代码。"
 
     lines = [f"搜索 '{q}' 的结果，共 {total} 处匹配（显示前 {len(items)} 条）:\n"]
@@ -170,6 +177,83 @@ async def search_code(
                 for fl in fragment.splitlines()[:5]:
                     lines.append(f"   > {fl}")
         lines.append("")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def search_repo(
+    query: Annotated[str, Field(description="仓库名关键词，例如 'kotlinx-io' 或 'ktor'")],
+    limit: Annotated[int, Field(description="返回结果数量，默认 5，最大 50")] = 5,
+) -> str:
+    """按名称搜索 GitHub 仓库。
+
+    通过 search/repositories API 搜索仓库，返回仓库全名（owner/name）、描述、
+    语言、star 数，用于定位正确的仓库（如组织名拼写不确定时纠错）。"""
+    per_page = max(1, min(int(limit), 50))
+    try:
+        async with _client(TIMEOUT) as client:
+            resp = await _get(
+                client,
+                f"{API_BASE}/search/repositories",
+                params={"q": query, "per_page": per_page},
+                headers=_headers(),
+            )
+    except Exception as e:
+        cause = f" cause={e.__cause__!r}" if e.__cause__ else ""
+        return f"搜索失败: API 服务不可用 ({type(e).__name__}: {e!r}{cause})"
+
+    if resp.status_code != 200:
+        return f"搜索失败: {_api_error(resp)}"
+
+    items = resp.json().get("items", [])
+    if not items:
+        return f"未找到仓库 '{query}'。"
+
+    lines = [f"搜索仓库 '{query}' 的结果（{resp.json().get('total_count', 0)} 处匹配，显示前 {len(items)} 条）:\n"]
+    for i, r in enumerate(items, 1):
+        lines.append(f"{i}. **{r['full_name']}** ⭐{r['stargazers_count']} ({r.get('language') or 'N/A'})")
+        lines.append(f"   {r['html_url']}")
+        desc = (r.get("description") or "").strip()
+        if desc:
+            lines.append(f"   {desc[:120]}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def get_repo(
+    repo: Annotated[str, Field(description="仓库名，格式 owner/name，例如 'Kotlin/kotlinx-io'")],
+) -> str:
+    """获取 GitHub 仓库信息，同时检查仓库是否存在。
+
+    返回仓库全名、可见性、默认分支、star 数、语言、描述等元信息。
+    仓库不存在或 token 无权限时给出明确提示。"""
+    try:
+        async with _client(TIMEOUT) as client:
+            resp = await _get(client, f"{API_BASE}/repos/{repo}", headers=_headers())
+    except Exception as e:
+        cause = f" cause={e.__cause__!r}" if e.__cause__ else ""
+        return f"查询失败: API 服务不可用 ({type(e).__name__}: {e!r}{cause})"
+
+    if resp.status_code == 404:
+        return f"仓库不存在或 token 无权限访问该仓库（{repo}）"
+    if resp.status_code != 200:
+        return f"查询失败: {_api_error(resp)}"
+
+    r = resp.json()
+    lines = [
+        f"# {r['full_name']}",
+        f"可见性: {'private' if r.get('private') else 'public'}  | 默认分支: {r.get('default_branch')}  | "
+        f"⭐{r.get('stargazers_count', 0)}  | 语言: {r.get('language') or 'N/A'}",
+        f"URL: {r['html_url']}",
+    ]
+    desc = (r.get("description") or "").strip()
+    if desc:
+        lines.append(f"描述: {desc[:150]}")
+    if r.get("fork"):
+        parent = (r.get("parent") or {}).get("full_name", "未知")
+        lines.append(f"来源: fork 自 {parent}")
+    lines.append(f"更新时间: {r.get('updated_at')}")
     return "\n".join(lines)
 
 
