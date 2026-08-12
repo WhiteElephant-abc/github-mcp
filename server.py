@@ -256,6 +256,73 @@ async def get_repo(
 
 
 @mcp.tool()
+async def list_tree(
+    repo: Annotated[str, Field(description="仓库名，格式 owner/name，例如 'Kotlin/kotlinx-io'")],
+    ref: Annotated[str | None, Field(description="分支、标签或 commit SHA。不传则使用仓库默认分支")] = None,
+    path: Annotated[str | None, Field(description="限定子目录，例如 'core/common/src'。不传则返回整个仓库树")] = None,
+    depth: Annotated[int | None, Field(description="目录深度限制：1=只列直接子项，2=子项+孙项。与 path 组合时从 path 之下计算")] = None,
+    limit: Annotated[int, Field(description="最大返回条目数（防爆兜底），默认 200，最大 1000")] = 200,
+) -> str:
+    """获取仓库的目录结构（文件树）。
+
+    通过 git/trees API 获取仓库文件树（recursive 全量），可按子目录（path）和
+    深度（depth）过滤，返回路径、类型（目录/文件）、大小。用于浏览仓库结构后定位文件路径。"""
+    limit = max(1, min(int(limit), 1000))
+    try:
+        async with _client(TIMEOUT) as client:
+            if not ref:
+                info = await _get(client, f"{API_BASE}/repos/{repo}", headers=_headers())
+                if info.status_code != 200:
+                    return f"查询失败: {_api_error(info)}"
+                ref = info.json()["default_branch"]
+            resp = await _get(
+                client,
+                f"{API_BASE}/repos/{repo}/git/trees/{ref}",
+                params={"recursive": "1"},
+                headers=_headers(),
+            )
+    except Exception as e:
+        cause = f" cause={e.__cause__!r}" if e.__cause__ else ""
+        return f"查询失败: API 服务不可用 ({type(e).__name__}: {e!r}{cause})"
+
+    if resp.status_code == 404:
+        return f"仓库或 ref 不存在（{repo}@{ref}）"
+    if resp.status_code != 200:
+        return f"查询失败: {_api_error(resp)}"
+
+    data = resp.json()
+    prefix = (path or "").rstrip("/")
+    items = []
+    for item in data.get("tree", []):
+        p = item.get("path", "")
+        if prefix and p != prefix and not p.startswith(prefix + "/"):
+            continue
+        if depth is not None:
+            rel = p[len(prefix) + 1 :] if prefix and p.startswith(prefix + "/") else ("" if p == prefix else p)
+            if rel and rel.count("/") + 1 > depth:
+                continue
+        if item.get("type") == "tree":
+            items.append(f"{p}/")
+        else:
+            size = item.get("size")
+            size_str = f" ({size} B)" if size is not None else ""
+            items.append(f"{p}{size_str}")
+    if not items:
+        return f"未找到路径 '{path or ''}'（ref={ref}）"
+    truncated = data.get("truncated", False)
+    shown = items[:limit]
+    lines = [
+        f"# {repo} 文件树（ref={ref}，共 {len(items)} 项，显示 {len(shown)} 条"
+        + ("，树已截断" if truncated else "")
+        + "):\n"
+    ]
+    lines.extend(shown)
+    if len(items) > limit:
+        lines.append(f"\n... 还有 {len(items) - limit} 项，可用 path/depth 参数缩小范围")
+    return "\n".join(lines)
+
+
+@mcp.tool()
 async def read_code(
     repo: Annotated[str, Field(description="仓库名，格式 owner/name，例如 'JetBrains/kotlin'")],
     path: Annotated[str, Field(description="文件路径，例如 'libraries/stdlib/src/kotlin/kotlin.kt'")],
