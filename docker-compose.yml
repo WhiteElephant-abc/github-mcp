@@ -1,0 +1,28 @@
+services:
+  mcp:
+    build:
+      context: .
+      network: host
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-}
+    container_name: github-code-search-mcp
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - .env
+    environment:
+      - HTTPS_PROXY=${HTTPS_PROXY:-}
+      - NO_PROXY=${NO_PROXY:-}
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import socket,os; s=socket.socket(); s.settimeout(3); s.connect(('127.0.0.1', int(os.getenv('PORT','8000')))); s.close()\""]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
