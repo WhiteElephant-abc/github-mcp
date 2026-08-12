@@ -251,6 +251,8 @@ async def get_repo(
     if r.get("fork"):
         parent = (r.get("parent") or {}).get("full_name", "未知")
         lines.append(f"来源: fork 自 {parent}")
+    lines.append(f"创建时间: {r.get('created_at')}")
+    lines.append(f"推送时间: {r.get('pushed_at')}")
     lines.append(f"更新时间: {r.get('updated_at')}")
     return "\n".join(lines)
 
