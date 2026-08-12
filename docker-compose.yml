@@ -7,7 +7,8 @@ services:
         HTTP_PROXY: ${HTTP_PROXY:-}
         HTTPS_PROXY: ${HTTPS_PROXY:-}
         NO_PROXY: ${NO_PROXY:-}
-    container_name: github-code-search-mcp
+    container_name: github-mcp
+    image: github-mcp
     restart: unless-stopped
     network_mode: host
     env_file:

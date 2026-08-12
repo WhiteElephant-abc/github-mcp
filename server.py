@@ -145,25 +145,23 @@ async def search_code(
                 params={"q": q, "per_page": per_page},
                 headers=_headers(text_match=True),
             )
+            if resp.status_code != 200:
+                return f"搜索失败: {_api_error(resp)}"
+            data = resp.json()
+            items = data.get("items", [])
+            total = data.get("total_count", 0)
+            if not items:
+                if repo:
+                    # 搜索 API 对不存在的 repo qualifier 静默返回 0 结果，用探针区分"仓库不存在"与"无匹配"
+                    info = await _get(client, f"{API_BASE}/repos/{repo}", headers=_headers())
+                    if info.status_code == 404:
+                        return f"搜索失败: 仓库不存在或 token 无权限访问该仓库（{repo}）"
+                    if info.status_code != 200:
+                        return f"搜索失败: 仓库探测异常: {_api_error(info)}"
+                return f"未找到与 '{q}' 相关的代码。"
     except Exception as e:
         cause = f" cause={e.__cause__!r}" if e.__cause__ else ""
         return f"搜索失败: API 服务不可用 ({type(e).__name__}: {e!r}{cause})"
-
-    if resp.status_code != 200:
-        return f"搜索失败: {_api_error(resp)}"
-
-    data = resp.json()
-    items = data.get("items", [])
-    total = data.get("total_count", 0)
-    if not items:
-        if repo:
-            # 搜索 API 对不存在的 repo qualifier 静默返回 0 结果，用探针区分"仓库不存在"与"无匹配"
-            info = await _get(client, f"{API_BASE}/repos/{repo}", headers=_headers())
-            if info.status_code == 404:
-                return f"搜索失败: 仓库不存在或 token 无权限访问该仓库（{repo}）"
-            if info.status_code != 200:
-                return f"搜索失败: 仓库探测异常: {_api_error(info)}"
-        return f"未找到与 '{q}' 相关的代码。"
 
     lines = [f"搜索 '{q}' 的结果，共 {total} 处匹配（显示前 {len(items)} 条）:\n"]
     for i, item in enumerate(items, 1):

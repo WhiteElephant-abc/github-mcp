@@ -33,10 +33,10 @@ http://localhost:8000/mcp
 
 ```bash
 # 全局生效，所有项目可用
-claude mcp add --scope user --transport http github-code-search http://localhost:8000/mcp
+claude mcp add --scope user --transport http github-mcp http://localhost:8000/mcp
 
 # 仅当前项目生效
-claude mcp add --transport http github-code-search http://localhost:8000/mcp
+claude mcp add --transport http github-mcp http://localhost:8000/mcp
 ```
 
 ### 可用工具
