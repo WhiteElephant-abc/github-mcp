@@ -146,7 +146,8 @@ async def search_code(
                 headers=_headers(text_match=True),
             )
     except Exception as e:
-        return f"搜索失败: API 服务不可用 ({type(e).__name__}: {e!r})"
+        cause = f" cause={e.__cause__!r}" if e.__cause__ else ""
+        return f"搜索失败: API 服务不可用 ({type(e).__name__}: {e!r}{cause})"
 
     if resp.status_code != 200:
         return f"搜索失败: {_api_error(resp)}"
@@ -203,7 +204,8 @@ async def read_code(
                 params = {"ref": ref or info.json()["default_branch"]}
                 resp = await _get(client, url, params=params, headers=_headers())
     except Exception as e:
-        return f"读取失败: API 服务不可用 ({type(e).__name__}: {e!r})"
+        cause = f" cause={e.__cause__!r}" if e.__cause__ else ""
+        return f"读取失败: API 服务不可用 ({type(e).__name__}: {e!r}{cause})"
 
     if resp.status_code == 404:
         return "读取失败: 文件路径不存在或 ref 无效（仓库可访问，请检查 path/ref 参数）"
@@ -218,7 +220,8 @@ async def read_code(
             async with _client(max(TIMEOUT * 3, 60)) as client:
                 raw = await _get(client, f"{RAW_BASE}/{repo}/{ref or 'HEAD'}/{path}")
         except Exception as e:
-            return f"读取失败: API 服务不可用 ({type(e).__name__}: {e!r})"
+            cause = f" cause={e.__cause__!r}" if e.__cause__ else ""
+            return f"读取失败: API 服务不可用 ({type(e).__name__}: {e!r}{cause})"
         if raw.status_code != 200:
             return f"读取失败: 文件超过 contents API 大小限制且 raw 获取失败 ({raw.status_code})"
         text = raw.text
