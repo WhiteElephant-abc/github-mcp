@@ -44,6 +44,13 @@ async def _get(
     for attempt in range(MAX_RETRIES):
         try:
             resp = await client.get(url, params=params, headers=headers)
+            if resp.status_code == 503 and attempt < MAX_RETRIES - 1:
+                print(
+                    f"[github-mcp] GitHub 服务端 503，退避 {2 ** attempt}s 后重试 url={url}",
+                    flush=True,
+                )
+                await asyncio.sleep(2**attempt)
+                continue
             if resp.status_code in (403, 429) and attempt < MAX_RETRIES - 1:
                 wait = None
                 retry_after = resp.headers.get("Retry-After")
