@@ -27,6 +27,30 @@ def _client(timeout: float) -> httpx.AsyncClient:
     return httpx.AsyncClient(timeout=timeout, trust_env=False, proxy=proxy_url)
 
 
+async def _repo_suggestions(client: httpx.AsyncClient, repo: str, limit: int = 3) -> str:
+    """仓库不存在时，按名字末段搜索相似仓库，返回候选列表文本（失败返回空串）"""
+    name = repo.split("/")[-1]
+    try:
+        resp = await _get(
+            client,
+            f"{API_BASE}/search/repositories",
+            params={"q": name, "per_page": limit},
+            headers=_headers(),
+        )
+    except Exception as e:
+        print(f"[github-mcp] 候选搜索失败 repo={repo} ({type(e).__name__}: {e!r})", flush=True)
+        return ""
+    if resp.status_code != 200:
+        return ""
+    items = resp.json().get("items", [])
+    if not items:
+        return ""
+    lines = ["\n相似仓库候选:"]
+    for r in items[:limit]:
+        lines.append(f"  - {r['full_name']} ⭐{r['stargazers_count']}（{r.get('language') or 'N/A'}）")
+    return "\n".join(lines)
+
+
 async def _get(
     client: httpx.AsyncClient,
     url: str,
@@ -162,7 +186,8 @@ async def search_code(
                     # 搜索 API 对不存在的 repo qualifier 静默返回 0 结果，用探针区分"仓库不存在"与"无匹配"
                     info = await _get(client, f"{API_BASE}/repos/{repo}", headers=_headers())
                     if info.status_code == 404:
-                        return f"搜索失败: 仓库不存在（{repo}）"
+                        suggest = await _repo_suggestions(client, repo)
+                        return f"搜索失败: 仓库不存在（{repo}）{suggest}"
                     if info.status_code != 200:
                         return f"搜索失败: 仓库探测异常: {_api_error(info)}"
                 return f"未找到与 '{q}' 相关的代码。"
@@ -236,12 +261,12 @@ async def get_repo(
     try:
         async with _client(TIMEOUT) as client:
             resp = await _get(client, f"{API_BASE}/repos/{repo}", headers=_headers())
+            if resp.status_code == 404:
+                suggest = await _repo_suggestions(client, repo)
+                return f"仓库不存在（{repo}）{suggest}"
     except Exception as e:
         cause = f" cause={e.__cause__!r}" if e.__cause__ else ""
         return f"查询失败: API 服务不可用 ({type(e).__name__}: {e!r}{cause})"
-
-    if resp.status_code == 404:
-        return f"仓库不存在（{repo}）"
     if resp.status_code != 200:
         return f"查询失败: {_api_error(resp)}"
 
@@ -356,7 +381,8 @@ async def read_code(
                 # GitHub 对无权限资源伪装 404，用仓库元信息探针区分"仓库不存在"与"路径不存在"
                 info = await _get(client, f"{API_BASE}/repos/{repo}", headers=_headers())
                 if info.status_code == 404:
-                    return "读取失败: 仓库不存在"
+                    suggest = await _repo_suggestions(client, repo)
+                    return f"读取失败: 仓库不存在（{repo}）{suggest}"
                 if info.status_code != 200:
                     return f"读取失败: 仓库探测异常: {_api_error(info)}"
                 params = {"ref": ref or info.json()["default_branch"]}
