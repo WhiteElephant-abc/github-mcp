@@ -155,7 +155,7 @@ async def search_code(
                     # 搜索 API 对不存在的 repo qualifier 静默返回 0 结果，用探针区分"仓库不存在"与"无匹配"
                     info = await _get(client, f"{API_BASE}/repos/{repo}", headers=_headers())
                     if info.status_code == 404:
-                        return f"搜索失败: 仓库不存在或 token 无权限访问该仓库（{repo}）"
+                        return f"搜索失败: 仓库不存在（{repo}）"
                     if info.status_code != 200:
                         return f"搜索失败: 仓库探测异常: {_api_error(info)}"
                 return f"未找到与 '{q}' 相关的代码。"
@@ -225,7 +225,7 @@ async def get_repo(
     """获取 GitHub 仓库信息，同时检查仓库是否存在。
 
     返回仓库全名、可见性、默认分支、star 数、语言、描述等元信息。
-    仓库不存在或 token 无权限时给出明确提示。"""
+    仓库不存在时给出明确提示。"""
     try:
         async with _client(TIMEOUT) as client:
             resp = await _get(client, f"{API_BASE}/repos/{repo}", headers=_headers())
@@ -234,7 +234,7 @@ async def get_repo(
         return f"查询失败: API 服务不可用 ({type(e).__name__}: {e!r}{cause})"
 
     if resp.status_code == 404:
-        return f"仓库不存在或 token 无权限访问该仓库（{repo}）"
+        return f"仓库不存在（{repo}）"
     if resp.status_code != 200:
         return f"查询失败: {_api_error(resp)}"
 
@@ -349,7 +349,7 @@ async def read_code(
                 # GitHub 对无权限资源伪装 404，用仓库元信息探针区分"仓库不存在"与"路径不存在"
                 info = await _get(client, f"{API_BASE}/repos/{repo}", headers=_headers())
                 if info.status_code == 404:
-                    return "读取失败: 仓库不存在或 token 无权限访问该仓库"
+                    return "读取失败: 仓库不存在"
                 if info.status_code != 200:
                     return f"读取失败: 仓库探测异常: {_api_error(info)}"
                 params = {"ref": ref or info.json()["default_branch"]}
