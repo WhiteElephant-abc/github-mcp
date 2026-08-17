@@ -144,6 +144,20 @@ def _api_error(resp: httpx.Response) -> str:
     return f"GitHub API 错误 {resp.status_code}: {msg}"
 
 
+async def _search_healthy(client: httpx.AsyncClient) -> bool:
+    """探测查询：GitHub 官方 docs 仓库搜 'GitHub'（必然命中），判断搜索服务是否正常"""
+    try:
+        resp = await _get(
+            client,
+            f"{API_BASE}/search/code",
+            params={"q": "GitHub repo:github/docs", "per_page": 1},
+            headers=_headers(),
+        )
+    except Exception:
+        return False
+    return resp.status_code == 200 and resp.json().get("total_count", 0) > 0
+
+
 @mcp.tool()
 async def search_code(
     query: Annotated[str, Field(description="搜索关键词，GitHub code search 语法，例如 'fun Any?.toString'。高级限定符也可直接内联传入（如 'foo in:file'）")],
@@ -190,6 +204,8 @@ async def search_code(
                         return f"搜索失败: 仓库不存在（{repo}）{suggest}"
                     if info.status_code != 200:
                         return f"搜索失败: 仓库探测异常: {_api_error(info)}"
+                if not await _search_healthy(client):
+                    return f"搜索无结果，且 GitHub 搜索服务异常（必然命中的探测查询也无结果），请稍后重试或检查 GitHub 状态页"
                 return f"未找到与 '{q}' 相关的代码。"
     except Exception as e:
         cause = f" cause={e.__cause__!r}" if e.__cause__ else ""
