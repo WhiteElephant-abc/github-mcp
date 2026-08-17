@@ -155,7 +155,8 @@ async def _search_healthy(client: httpx.AsyncClient) -> bool:
         )
     except Exception:
         return False
-    return resp.status_code == 200 and resp.json().get("total_count", 0) > 0
+    # 故障时 total_count 可能 >0 但 items 为空，必须基于 items 判定
+    return resp.status_code == 200 and bool(resp.json().get("items"))
 
 
 @mcp.tool()
@@ -205,7 +206,7 @@ async def search_code(
                     if info.status_code != 200:
                         return f"搜索失败: 仓库探测异常: {_api_error(info)}"
                 if not await _search_healthy(client):
-                    return f"搜索无结果，且 GitHub 搜索服务异常（必然命中的探测查询也无结果），请稍后重试或检查 GitHub 状态页"
+                    return "GitHub 搜索服务异常，请稍后重试或检查 GitHub 状态页"
                 return f"未找到与 '{q}' 相关的代码。"
     except Exception as e:
         cause = f" cause={e.__cause__!r}" if e.__cause__ else ""
