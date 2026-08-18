@@ -161,7 +161,7 @@ async def _search_healthy(client: httpx.AsyncClient) -> bool:
 
 @mcp.tool()
 async def search_code(
-    query: Annotated[str, Field(description="搜索关键词，GitHub code search 语法，例如 'fun Any?.toString'。高级限定符也可直接内联传入（如 'foo in:file'）")],
+    query: Annotated[str, Field(description="搜索关键词，GitHub code search 语法，例如 'fun Any?.toString'。高级限定符也可直接内联传入（如 'foo in:file'）。引号用法：空格分隔=多词 AND（词序不限）；双引号=精确短语（词序固定，如 '\"const val size\"'）；连字符开头=排除该词（带连字符的词需加引号，如 '\"-gx\"'）；无法直接搜索引号字符本身（引号是语法定界符，代码内的引号被忽略）")],
     repo: Annotated[str | None, Field(description="限定仓库，格式 owner/name，例如 'JetBrains/kotlin'。不传则搜索全 GitHub 所有仓库")] = None,
     language: Annotated[str | None, Field(description="按语言过滤，例如 'kotlin'")] = None,
     filename: Annotated[str | None, Field(description="按文件名过滤（精确匹配，glob 通配符如 *.kt 不生效），例如 'String.kt'")] = None,
