@@ -472,8 +472,7 @@ async def download(
     """下载 GitHub 仓库中的文件到本地磁盘。
 
     保存路径为 <DOWNLOAD_ROOT>/<owner>/<repo>/<仓库内路径>，默认根目录
-    /tmp/github-mcp。按原始字节写入，支持二进制文件；超过 contents API
-    1 MiB 限制的文件自动回退 raw.githubusercontent.com。"""
+    /tmp/github-mcp。按原始字节写入，支持二进制文件。"""
     try:
         dest = _dest_path(repo, path)
     except ValueError as e:

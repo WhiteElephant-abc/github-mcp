@@ -74,7 +74,7 @@ claude mcp add --transport http github-mcp http://localhost:8000/mcp
 | `MAX_RETRIES` | 否 | 单次请求最大尝试次数，默认 `3`；传输错误和 503 按 1/2/4… 秒指数退避重试 |
 | `TIMEOUT` | 否 | API 请求超时秒数，默认 `20`；raw 大文件下载自动放大到 3 倍且不低于 60 秒 |
 | `DOWNLOAD_ROOT` | 否 | `download` 工具的保存根目录，默认 `/tmp/github-mcp` |
-| `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` | 否 | 代理。compose 从宿主 shell 环境透传，服务端按 `HTTPS_PROXY` → `HTTP_PROXY` 顺序读取 |
+| `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` | 否 | 代理。写在此 `.env` 中，构建与运行时统一读取；未配置时回落到启动 compose 的 shell 环境 |
 
 ## 本地运行（非 Docker）
 
