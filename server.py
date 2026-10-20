@@ -23,10 +23,36 @@ _next_request_time = 0.0  # 全局共享的限流恢复时刻（epoch 秒），�
 mcp = MCPServer("GitHub Code Search")
 
 
-def _client(timeout: float) -> httpx.AsyncClient:
-    """构造 httpx 客户端：手动指定代理，避免解析 NO_PROXY 中的 IPv6 条目报错"""
-    proxy_url = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
-    return httpx.AsyncClient(timeout=timeout, trust_env=False, proxy=proxy_url)
+_http_client: httpx.AsyncClient | None = None
+
+
+class _SharedClient:
+    """共享 AsyncClient 的上下文包装：退出 async with 时不关闭底层连接池"""
+
+    def __init__(self, client: httpx.AsyncClient):
+        self._client = client
+
+    async def __aenter__(self) -> httpx.AsyncClient:
+        return self._client
+
+    async def __aexit__(self, *exc_info) -> None:
+        pass
+
+
+def _client() -> _SharedClient:
+    """返回进程级共享的 httpx 客户端，跨工具调用复用连接池
+
+    手动指定代理，避免解析 NO_PROXY 中的 IPv6 条目报错。"""
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        proxy_url = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
+        _http_client = httpx.AsyncClient(
+            timeout=TIMEOUT,
+            trust_env=False,
+            proxy=proxy_url,
+            limits=httpx.Limits(max_keepalive_connections=20, keepalive_expiry=60.0),
+        )
+    return _SharedClient(_http_client)
 
 
 async def _repo_suggestions(client: httpx.AsyncClient, repo: str, limit: int = 3) -> str:
@@ -59,6 +85,7 @@ async def _get(
     *,
     params: dict | None = None,
     headers: dict | None = None,
+    timeout: float | None = None,
 ) -> httpx.Response:
     """GET 请求：传输层错误指数退避重试，限流按 Retry-After / X-RateLimit-Reset 等待，恢复时刻全局共享"""
     global _next_request_time
@@ -69,7 +96,7 @@ async def _get(
         await asyncio.sleep(wait)
     for attempt in range(MAX_RETRIES):
         try:
-            resp = await client.get(url, params=params, headers=headers)
+            resp = await client.get(url, params=params, headers=headers, timeout=timeout)
             if resp.status_code == 503 and attempt < MAX_RETRIES - 1:
                 print(
                     f"[github-mcp] GitHub 服务端 503，退避 {2 ** attempt}s 后重试 url={url}",
@@ -186,7 +213,7 @@ async def search_code(
     per_page = max(1, min(int(limit), 50))
 
     try:
-        async with _client(TIMEOUT) as client:
+        async with _client() as client:
             resp = await _get(
                 client,
                 f"{API_BASE}/search/code",
@@ -240,7 +267,7 @@ async def search_repo(
     语言、star 数，用于定位正确的仓库（如组织名拼写不确定时纠错）。"""
     per_page = max(1, min(int(limit), 50))
     try:
-        async with _client(TIMEOUT) as client:
+        async with _client() as client:
             resp = await _get(
                 client,
                 f"{API_BASE}/search/repositories",
@@ -278,7 +305,7 @@ async def get_repo(
     返回仓库全名、可见性、默认分支、star 数、语言、描述等元信息。
     仓库不存在时给出明确提示。"""
     try:
-        async with _client(TIMEOUT) as client:
+        async with _client() as client:
             resp = await _get(client, f"{API_BASE}/repos/{repo}", headers=_headers())
             if resp.status_code == 404:
                 suggest = await _repo_suggestions(client, repo)
@@ -321,8 +348,48 @@ async def list_tree(
     通过 git/trees API 获取仓库文件树（recursive 全量），可按子目录（path）和
     深度（depth）过滤，返回路径、类型（目录/文件）、大小。用于浏览仓库结构后定位文件路径。"""
     limit = max(1, min(int(limit), 1000))
+    if depth == 1:
+        # 只列一层时走 contents API：避免拉取全量 recursive 树（大仓库会被截断且很慢）
+        prefix = (path or "").rstrip("/")
+        contents_url = f"{API_BASE}/repos/{repo}/contents"
+        if prefix:
+            contents_url += f"/{quote(prefix, safe='/')}"
+        try:
+            async with _client() as client:
+                resp = await _get(
+                    client,
+                    contents_url,
+                    params={"ref": ref} if ref else None,
+                    headers=_headers(),
+                )
+        except Exception as e:
+            cause = f" cause={e.__cause__!r}" if e.__cause__ else ""
+            return f"查询失败: API 服务不可用 ({type(e).__name__}: {e!r}{cause})"
+        if resp.status_code == 404:
+            return f"未找到路径 '{prefix or '/'}'（ref={ref or 'default'}）"
+        if resp.status_code != 200:
+            return f"查询失败: {_api_error(resp)}"
+        body = resp.json()
+        if not isinstance(body, list):
+            return f"'{prefix}' 是文件而非目录；可用 read_code 读取"
+        shown = body[:limit]
+        lines = [
+            f"# {repo} — {prefix or '/'}（ref={ref or 'default'}，"
+            f"共 {len(body)} 项，显示 {len(shown)} 条）:\n"
+        ]
+        for it in shown:
+            name = it.get("name", "")
+            p = f"{prefix}/{name}" if prefix else name
+            if it.get("type") == "dir":
+                lines.append(f"{p}/")
+            else:
+                size = it.get("size")
+                lines.append(f"{p}" + (f" ({size} B)" if size is not None else ""))
+        if len(body) > limit:
+            lines.append(f"\n... 还有 {len(body) - limit} 项，可用 limit 调整")
+        return "\n".join(lines)
     try:
-        async with _client(TIMEOUT) as client:
+        async with _client() as client:
             if not ref:
                 info = await _get(client, f"{API_BASE}/repos/{repo}", headers=_headers())
                 if info.status_code != 200:
@@ -344,6 +411,7 @@ async def list_tree(
         return f"查询失败: {_api_error(resp)}"
 
     data = resp.json()
+    truncated = data.get("truncated", False)
     prefix = (path or "").rstrip("/")
     items = []
     for item in data.get("tree", []):
@@ -361,8 +429,50 @@ async def list_tree(
             size_str = f" ({size} B)" if size is not None else ""
             items.append(f"{p}{size_str}")
     if not items:
+        if truncated:
+            # 全量树被 GitHub 截断（超大仓库），改用 contents API 判断路径是否存在并列出直接子项
+            try:
+                async with _client() as client:
+                    probe = await _get(
+                        client,
+                        f"{API_BASE}/repos/{repo}/contents/{quote(prefix, safe='/')}",
+                        params={"ref": ref},
+                        headers=_headers(),
+                    )
+            except Exception as e:
+                cause = f" cause={e.__cause__!r}" if e.__cause__ else ""
+                return f"查询失败: API 服务不可用 ({type(e).__name__}: {e!r}{cause})"
+            if probe.status_code == 200:
+                body = probe.json()
+                if isinstance(body, list):
+                    shown = body[:limit]
+                    lines = [
+                        f"# {repo} — {prefix or '/'}（ref={ref}）",
+                        f"仓库文件树被 GitHub 截断，以下为该目录的直接子项"
+                        f"（共 {len(body)} 项，显示 {len(shown)} 条，depth 参数不生效）:\n",
+                    ]
+                    base = f"{prefix}/" if prefix else ""
+                    for it in shown:
+                        name = it.get("name", "")
+                        if it.get("type") == "dir":
+                            lines.append(f"{base}{name}/")
+                        else:
+                            size = it.get("size")
+                            lines.append(f"{base}{name}" + (f" ({size} B)" if size is not None else ""))
+                    if len(body) > limit:
+                        lines.append(f"\n... 还有 {len(body) - limit} 项")
+                    return "\n".join(lines)
+                return (
+                    f"'{prefix}' 是文件而非目录（文件树被截断，已用 contents API 确认）；"
+                    "可用 read_code 读取"
+                )
+            if probe.status_code == 404:
+                return (
+                    f"未找到路径 '{prefix}'（仓库文件树已被 GitHub 截断，"
+                    "contents API 也确认该路径不存在）"
+                )
+            return f"查询失败: {_api_error(probe)}"
         return f"未找到路径 '{path or ''}'（ref={ref}）"
-    truncated = data.get("truncated", False)
     shown = items[:limit]
     lines = [
         f"# {repo} 文件树（ref={ref}，共 {len(items)} 项，显示 {len(shown)} 条"
@@ -391,7 +501,7 @@ async def read_code(
     max_lines = max(1, min(int(max_lines), MAX_LINES))
 
     try:
-        async with _client(TIMEOUT) as client:
+        async with _client() as client:
             url = f"{API_BASE}/repos/{repo}/contents/{path}"
             params = {"ref": ref} if ref else None
             resp = await _get(client, url, params=params, headers=_headers())
@@ -420,8 +530,12 @@ async def read_code(
     if content is None:
         # 文件超过 1 MiB 时 contents API 只返回 blob 链接，回退 raw 端点
         try:
-            async with _client(max(TIMEOUT * 3, 60)) as client:
-                raw = await _get(client, f"{RAW_BASE}/{repo}/{ref or 'HEAD'}/{path}")
+            async with _client() as client:
+                raw = await _get(
+                    client,
+                    f"{RAW_BASE}/{repo}/{ref or 'HEAD'}/{path}",
+                    timeout=max(TIMEOUT * 3, 60),
+                )
         except Exception as e:
             cause = f" cause={e.__cause__!r}" if e.__cause__ else ""
             return f"读取失败: API 服务不可用 ({type(e).__name__}: {e!r}{cause})"
@@ -479,7 +593,7 @@ async def download(
         return f"下载失败: {e}"
 
     try:
-        async with _client(TIMEOUT) as client:
+        async with _client() as client:
             url = f"{API_BASE}/repos/{repo}/contents/{quote(path, safe='/')}"
             params = {"ref": ref} if ref else None
             resp = await _get(client, url, params=params, headers=_headers())
@@ -510,11 +624,12 @@ async def download(
                 # 文件超过 1 MiB 时 contents API 只返回 blob 链接（encoding=none），回退 raw 端点
                 raw_ref = quote(ref, safe="/") if ref else "HEAD"
                 try:
-                    async with _client(max(TIMEOUT * 3, 60)) as raw_client:
+                    async with _client() as raw_client:
                         raw = await _get(
                             raw_client,
                             f"{RAW_BASE}/{repo}/{raw_ref}/{quote(path, safe='/')}",
                             headers=_headers(),
+                            timeout=max(TIMEOUT * 3, 60),
                         )
                 except Exception as e:
                     cause = f" cause={e.__cause__!r}" if e.__cause__ else ""
