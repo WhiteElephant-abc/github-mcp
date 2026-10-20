@@ -11,6 +11,10 @@ services:
     image: github-mcp
     restart: unless-stopped
     network_mode: host
+    volumes:
+      - /tmp/github-mcp:/tmp/github-mcp
+    tmpfs:
+      - /tmp
     env_file:
       - .env
     environment:

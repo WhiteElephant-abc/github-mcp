@@ -5,6 +5,7 @@ import base64
 import os
 import time
 from typing import Annotated
+from urllib.parse import quote
 
 import httpx
 from mcp.server.mcpserver import MCPServer
@@ -16,6 +17,7 @@ TOKEN = os.getenv("GITHUB_TOKEN", "")
 MAX_LINES = 2000
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 TIMEOUT = int(os.getenv("TIMEOUT", "20"))
+DOWNLOAD_ROOT = os.getenv("DOWNLOAD_ROOT", "/tmp/github-mcp")
 _next_request_time = 0.0  # 全局共享的限流恢复时刻（epoch 秒），所有请求共用
 
 mcp = MCPServer("GitHub Code Search")
@@ -450,6 +452,94 @@ async def read_code(
     ]
     out.extend(f"{i:>{width}} | {line}" for i, line in enumerate(selected, start_line))
     return "\n".join(out)
+
+
+def _dest_path(repo: str, path: str) -> str:
+    """拼出本地保存路径：<DOWNLOAD_ROOT>/<owner>/<repo>/<仓库内路径>"""
+    parts = repo.split("/")
+    if len(parts) != 2 or not all(parts):
+        raise ValueError(f"仓库名格式错误（{repo}），应为 owner/name")
+    # 去掉前导 /，否则 os.path.join 会丢弃下载根目录
+    return os.path.normpath(os.path.join(DOWNLOAD_ROOT, *parts, path.lstrip("/")))
+
+
+@mcp.tool()
+async def download(
+    repo: Annotated[str, Field(description="仓库名，格式 owner/name，例如 'JetBrains/kotlin'")],
+    path: Annotated[str, Field(description="文件在仓库中的路径，例如 'libraries/stdlib/src/kotlin/Library.kt'")],
+    ref: Annotated[str | None, Field(description="分支、标签或 commit SHA。不传则使用仓库默认分支")] = None,
+) -> str:
+    """下载 GitHub 仓库中的文件到本地磁盘。
+
+    保存路径为 <DOWNLOAD_ROOT>/<owner>/<repo>/<仓库内路径>，默认根目录
+    /tmp/github-mcp。按原始字节写入，支持二进制文件；超过 contents API
+    1 MiB 限制的文件自动回退 raw.githubusercontent.com。"""
+    try:
+        dest = _dest_path(repo, path)
+    except ValueError as e:
+        return f"下载失败: {e}"
+
+    try:
+        async with _client(TIMEOUT) as client:
+            url = f"{API_BASE}/repos/{repo}/contents/{quote(path, safe='/')}"
+            params = {"ref": ref} if ref else None
+            resp = await _get(client, url, params=params, headers=_headers())
+            if resp.status_code == 404:
+                # GitHub 对无权限资源伪装 404，用仓库元信息探针区分"仓库不存在"与"路径不存在"
+                info = await _get(client, f"{API_BASE}/repos/{repo}", headers=_headers())
+                if info.status_code == 404:
+                    suggest = await _repo_suggestions(client, repo)
+                    return f"下载失败: 仓库不存在（{repo}）{suggest}"
+                if info.status_code != 200:
+                    return f"下载失败: 仓库探测异常: {_api_error(info)}"
+                params = {"ref": ref or info.json()["default_branch"]}
+                resp = await _get(client, url, params=params, headers=_headers())
+            if resp.status_code != 200:
+                return f"下载失败: {_api_error(resp)}"
+
+            body = resp.json()
+            if isinstance(body, list):
+                return f"下载失败: '{path}' 是目录而非文件（可用 list_tree 查看目录内容）"
+
+            encoding = body.get("encoding")
+            content = body.get("content")
+            sha = body.get("sha", "")
+            if encoding == "base64":
+                # 空文件 content 也是 ""，这里的 or "" 兼容两种空值
+                data = base64.b64decode(content or "")
+            else:
+                # 文件超过 1 MiB 时 contents API 只返回 blob 链接（encoding=none），回退 raw 端点
+                raw_ref = quote(ref, safe="/") if ref else "HEAD"
+                try:
+                    async with _client(max(TIMEOUT * 3, 60)) as raw_client:
+                        raw = await _get(
+                            raw_client,
+                            f"{RAW_BASE}/{repo}/{raw_ref}/{quote(path, safe='/')}",
+                            headers=_headers(),
+                        )
+                except Exception as e:
+                    cause = f" cause={e.__cause__!r}" if e.__cause__ else ""
+                    return f"下载失败: API 服务不可用 ({type(e).__name__}: {e!r}{cause})"
+                if raw.status_code != 200:
+                    return f"下载失败: 文件超过 contents API 大小限制且 raw 获取失败 ({raw.status_code})"
+                data = raw.content
+                sha = ""
+    except Exception as e:
+        cause = f" cause={e.__cause__!r}" if e.__cause__ else ""
+        return f"下载失败: API 服务不可用 ({type(e).__name__}: {e!r}{cause})"
+
+    try:
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "wb") as f:
+            f.write(data)
+    except OSError as e:
+        return f"下载失败: 写入文件出错 ({type(e).__name__}: {e})"
+
+    return (
+        f"已下载 {repo} — {path}\n"
+        f"保存到: {dest}\n"
+        f"ref={ref or 'default'}  | 大小 {len(data)} B  | sha={sha[:12] or 'N/A'}"
+    )
 
 
 if __name__ == "__main__":
