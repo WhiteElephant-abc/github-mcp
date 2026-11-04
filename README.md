@@ -30,9 +30,13 @@ docker compose ps
 > 构建并启动；等价的手动命令为：
 >
 > ```bash
+> set -a && . ./.env && set +a
 > docker buildx bake -f docker-compose.yml --allow=network.host
-> docker compose up -d --no-build
+> docker compose up -d --no-build --wait
 > ```
+>
+> `docker compose` 的变量插值会优先使用当前 shell 的环境变量（高于 `.env`），
+> 所以直接执行 `docker compose up` 可能与 `make up` 行为不同；代理统一写在 `.env`。
 
 其他 Makefile 目标：`make down` 停止并删除容器，`make logs` 跟踪日志。
 
@@ -76,7 +80,7 @@ claude mcp add --transport http github-mcp http://localhost:8000/mcp
 | `MAX_RETRIES` | 否 | 单次请求最大尝试次数，默认 `3`；传输错误和 503 按 1/2/4… 秒指数退避重试 |
 | `TIMEOUT` | 否 | API 请求超时秒数，默认 `20`；raw 大文件下载自动放大到 3 倍且不低于 60 秒 |
 | `DOWNLOAD_ROOT` | 否 | `download` 工具的保存根目录，默认 `/tmp/github-mcp` |
-| `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` | 否 | 代理。写在此 `.env` 中，构建与运行时统一读取；未配置时回落到启动 compose 的 shell 环境 |
+| `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` | 否 | 代理。写在此 `.env` 中，构建与运行时统一读取（服务端按 `HTTPS_PROXY` → `HTTP_PROXY` 顺序；`NO_PROXY` 仅用于构建和容器环境）。未配置时回落到启动 compose 的 shell 环境 |
 
 ## 本地运行（非 Docker）
 
@@ -89,8 +93,9 @@ GITHUB_TOKEN=<你的 GitHub token> .venv/bin/python server.py
 ## 说明
 
 - GitHub code search 只索引仓库的**默认分支**
-- `read_code` 和 `download` 遇到超过 1 MiB 的文件时自动回退到 `raw.githubusercontent.com`
+- `read_code`、`download`、`grep` 遇到超过 1 MiB 的文件时自动回退到 `raw.githubusercontent.com`
 - `download` 按原始字节写入，支持二进制文件
+- `read_code` 读取上限 20 MiB，`grep` 文件上限 10 MiB、正则匹配超时 10 秒
 - 403/429 限流按 `Retry-After` / `X-RateLimit-Reset` 等待，恢复时刻在进程内所有请求间共享
 - compose 配置将容器 `/tmp` 设为 tmpfs，并把 `/tmp/github-mcp` 绑定到宿主机同名目录，客户端可直接读取下载结果；若宿主 `/tmp` 本身是 tmpfs，下载文件会随宿主重启丢失
 - 容器以 root 运行，宿主上下载文件的属主为 root；需要当前用户可写时，可给服务加 `user:` 或预先 `chown`

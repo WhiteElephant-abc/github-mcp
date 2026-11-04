@@ -1,4 +1,4 @@
-"""GitHub Code Search MCP Server — 提供 GitHub 代码搜索和文件读取工具"""
+"""GitHub Code Search MCP Server — 提供 GitHub 代码搜索、读取、下载与 grep 工具"""
 
 import asyncio
 import base64
@@ -12,36 +12,43 @@ import httpx
 from mcp.server.mcpserver import MCPServer
 from pydantic import Field
 
+
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    """读取整数环境变量；非法值回退默认值，并保证不低于 minimum。"""
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        print(f"[github-mcp] 环境变量 {name}={raw!r} 不是整数，使用默认值 {default}", flush=True)
+        return default
+
+
 API_BASE = "https://api.github.com"
 RAW_BASE = "https://raw.githubusercontent.com"
 TOKEN = os.getenv("GITHUB_TOKEN", "")
 MAX_LINES = 2000
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
-TIMEOUT = int(os.getenv("TIMEOUT", "20"))
+MAX_RETRIES = _env_int("MAX_RETRIES", 3)
+TIMEOUT = _env_int("TIMEOUT", 20)
 DOWNLOAD_ROOT = os.getenv("DOWNLOAD_ROOT", "/tmp/github-mcp")
-_next_request_time = 0.0  # 全局共享的限流恢复时刻（epoch 秒），所有请求共用
+RATE_LIMIT_MAX_WAIT = 120.0  # 单次限流等待上限（秒）
+READ_MAX_BYTES = 20 * 1024 * 1024
+GREP_MAX_BYTES = 10 * 1024 * 1024
+GREP_TIMEOUT = 10.0
+
+_next_request_time = 0.0  # 全局共享的限流恢复时刻（epoch 秒）
+_http_client: httpx.AsyncClient | None = None
 
 mcp = MCPServer("GitHub Code Search")
 
 
-_http_client: httpx.AsyncClient | None = None
+class _ToolError(Exception):
+    """携带可直接展示给调用方的错误信息"""
 
 
-class _SharedClient:
-    """共享 AsyncClient 的上下文包装：退出 async with 时不关闭底层连接池"""
-
-    def __init__(self, client: httpx.AsyncClient):
-        self._client = client
-
-    async def __aenter__(self) -> httpx.AsyncClient:
-        return self._client
-
-    async def __aexit__(self, *exc_info) -> None:
-        pass
-
-
-def _client() -> _SharedClient:
-    """返回进程级共享的 httpx 客户端，跨工具调用复用连接池
+def _client() -> httpx.AsyncClient:
+    """进程级共享客户端，复用连接池
 
     手动指定代理，避免解析 NO_PROXY 中的 IPv6 条目报错。"""
     global _http_client
@@ -51,33 +58,25 @@ def _client() -> _SharedClient:
             timeout=TIMEOUT,
             trust_env=False,
             proxy=proxy_url,
+            follow_redirects=True,
             limits=httpx.Limits(max_keepalive_connections=20, keepalive_expiry=60.0),
         )
-    return _SharedClient(_http_client)
+    return _http_client
 
 
-async def _repo_suggestions(client: httpx.AsyncClient, repo: str, limit: int = 3) -> str:
-    """仓库不存在时，按名字末段搜索相似仓库，返回候选列表文本（失败返回空串）"""
-    name = repo.split("/")[-1]
-    try:
-        resp = await _get(
-            client,
-            f"{API_BASE}/search/repositories",
-            params={"q": name, "per_page": limit},
-            headers=_headers(),
-        )
-    except Exception as e:
-        print(f"[github-mcp] 候选搜索失败 repo={repo} ({type(e).__name__}: {e!r})", flush=True)
-        return ""
-    if resp.status_code != 200:
-        return ""
-    items = resp.json().get("items", [])
-    if not items:
-        return ""
-    lines = ["\n相似仓库候选:"]
-    for r in items[:limit]:
-        lines.append(f"  - {r['full_name']} ⭐{r['stargazers_count']}（{r.get('language') or 'N/A'}）")
-    return "\n".join(lines)
+def _transport_error(e: Exception) -> str:
+    cause = f" cause={e.__cause__!r}" if e.__cause__ else ""
+    return f"API 服务不可用 ({type(e).__name__}: {e!r}{cause})"
+
+
+async def _wait_for_window() -> None:
+    """等待共享限流窗口，单次等待不超过上限，避免长时间挂起。"""
+    now = time.time()
+    if _next_request_time <= now:
+        return
+    wait = min(_next_request_time - now, RATE_LIMIT_MAX_WAIT)
+    print(f"[github-mcp] 共享限流窗口内，等待 {wait:.0f}s", flush=True)
+    await asyncio.sleep(wait)
 
 
 async def _get(
@@ -88,16 +87,15 @@ async def _get(
     headers: dict | None = None,
     timeout: float | None = None,
 ) -> httpx.Response:
-    """GET 请求：传输层错误指数退避重试，限流按 Retry-After / X-RateLimit-Reset 等待，恢复时刻全局共享"""
+    """GET 请求：传输错误/503 指数退避，限流按 Retry-After / Reset 等待（有上限、全局共享）"""
     global _next_request_time
-    now = time.time()
-    if _next_request_time > now:
-        wait = _next_request_time - now
-        print(f"[github-mcp] 共享限流窗口内，提前等待 {wait:.0f}s url={url}", flush=True)
-        await asyncio.sleep(wait)
     for attempt in range(MAX_RETRIES):
+        await _wait_for_window()
         try:
-            resp = await client.get(url, params=params, headers=headers, timeout=timeout)
+            kwargs: dict = {"params": params, "headers": headers}
+            if timeout is not None:
+                kwargs["timeout"] = timeout
+            resp = await client.get(url, **kwargs)
             if resp.status_code == 503 and attempt < MAX_RETRIES - 1:
                 print(
                     f"[github-mcp] GitHub 服务端 503，退避 {2 ** attempt}s 后重试 url={url}",
@@ -109,12 +107,19 @@ async def _get(
                 wait = None
                 retry_after = resp.headers.get("Retry-After")
                 if retry_after:
-                    wait = max(1.0, float(retry_after))
+                    try:
+                        wait = max(1.0, float(retry_after))
+                    except ValueError:
+                        wait = None
                 elif resp.headers.get("X-RateLimit-Remaining") == "0":
                     reset = resp.headers.get("X-RateLimit-Reset")
                     if reset:
-                        wait = max(1.0, float(reset) - time.time())
+                        try:
+                            wait = max(1.0, float(reset) - time.time())
+                        except ValueError:
+                            wait = None
                 if wait is not None:
+                    wait = min(wait, RATE_LIMIT_MAX_WAIT)
                     _next_request_time = max(_next_request_time, time.time() + wait)
                     print(
                         f"[github-mcp] 限流 {resp.status_code} 等待 {wait:.0f}s 后重试"
@@ -151,155 +156,6 @@ def _headers(*, text_match: bool = False) -> dict[str, str]:
     return headers
 
 
-_repo_meta_cache: dict[str, tuple[float, dict]] = {}
-_archive_notice_cache: dict[str, tuple[float, str]] = {}
-_REPO_META_TTL = 600  # 秒
-
-
-async def _repo_meta(client: httpx.AsyncClient, repo: str) -> dict | None:
-    """获取仓库元信息（进程内缓存，避免归档检查重复请求）"""
-    key = repo.lower()
-    now = time.time()
-    cached = _repo_meta_cache.get(key)
-    if cached and now - cached[0] < _REPO_META_TTL:
-        return cached[1]
-    try:
-        resp = await _get(client, f"{API_BASE}/repos/{repo}", headers=_headers())
-    except Exception as e:
-        print(f"[github-mcp] 仓库元信息获取失败 repo={repo} ({type(e).__name__}: {e!r})", flush=True)
-        return None
-    if resp.status_code != 200:
-        return None
-    data = resp.json()
-    _repo_meta_cache[key] = (now, data)
-    return data
-
-
-async def _readme_text(client: httpx.AsyncClient, repo: str) -> str:
-    """读取默认分支 README 的文本内容（最多 64 KiB），失败返回空串"""
-    try:
-        resp = await _get(client, f"{API_BASE}/repos/{repo}/readme", headers=_headers())
-    except Exception:
-        return ""
-    if resp.status_code != 200:
-        return ""
-    try:
-        content = resp.json().get("content")
-        if not content:
-            return ""
-        return base64.b64decode(content).decode("utf-8", errors="ignore")[:65536]
-    except Exception:
-        return ""
-
-
-async def _owner_repos(client: httpx.AsyncClient, owner: str, limit: int = 5) -> list[str]:
-    """列出 owner（组织或用户）下最近更新的未归档仓库"""
-    for qualifier in ("org", "user"):
-        try:
-            resp = await _get(
-                client,
-                f"{API_BASE}/search/repositories",
-                params={
-                    "q": f"{qualifier}:{owner} archived:false",
-                    "sort": "updated",
-                    "order": "desc",
-                    "per_page": limit,
-                },
-                headers=_headers(),
-            )
-        except Exception as e:
-            print(
-                f"[github-mcp] owner 仓库搜索失败 owner={owner} ({type(e).__name__}: {e!r})",
-                flush=True,
-            )
-            continue
-        if resp.status_code == 200:
-            names = [
-                r.get("full_name", "")
-                for r in resp.json().get("items", [])
-                if r.get("full_name")
-            ]
-            if names:
-                return names
-    return []
-
-
-async def _archived_notice(
-    client: httpx.AsyncClient,
-    repo: str,
-    data: dict | None = None,
-    include_description: bool = True,
-) -> str:
-    """仓库已归档时返回警告和未归档候选，否则返回空串"""
-    meta = data or await _repo_meta(client, repo)
-    if not meta or not meta.get("archived"):
-        return ""
-
-    key = repo.lower()
-    now = time.time()
-    cached = _archive_notice_cache.get(key)
-    if cached and now - cached[0] < _REPO_META_TTL:
-        return cached[1]
-
-    reserved = {"orgs", "users", "topics", "sponsors", "marketplace", "login", "settings"}
-    owner = repo.split("/")[0]
-    name = repo.split("/")[-1]
-
-    # 同 owner 的未归档仓库
-    same_owner = await _owner_repos(client, owner, limit=5)
-
-    # 全站按名称匹配的未归档仓库
-    site_matches: list[str] = []
-    try:
-        resp = await _get(
-            client,
-            f"{API_BASE}/search/repositories",
-            params={"q": f"{name} archived:false", "per_page": 5},
-            headers=_headers(),
-        )
-        if resp.status_code == 200:
-            for item in resp.json().get("items", []):
-                full_name = item.get("full_name", "")
-                if full_name and full_name.lower() != key:
-                    site_matches.append(full_name)
-    except Exception as e:
-        print(
-            f"[github-mcp] 全站候选搜索失败 repo={repo} ({type(e).__name__}: {e!r})",
-            flush=True,
-        )
-
-    # README 中出现的 GitHub 仓库链接
-    readme_matches: list[str] = []
-    readme = await _readme_text(client, repo)
-    for match in re.finditer(
-        r"github\.com/([A-Za-z0-9_.-]+)(?:/([A-Za-z0-9_.-]+))?", readme
-    ):
-        org = match.group(1).rstrip(".,);]")
-        ref = (match.group(2) or "").rstrip(".,);]")
-        if org.lower() in reserved:
-            continue
-        found = f"{org}/{ref}" if ref else org
-        if found.lower() != key and found not in readme_matches:
-            readme_matches.append(found)
-        if len(readme_matches) >= 5:
-            break
-
-    pushed = (meta.get("pushed_at") or "未知")[:10]
-    lines = [f"\n⚠ {repo} 已归档，停止更新（最后推送 {pushed}）。"]
-    desc = (meta.get("description") or "").strip()
-    if desc and include_description:
-        lines.append(f"描述: {desc[:300]}")
-    if same_owner:
-        lines.append("同 owner 的未归档仓库: " + "、".join(same_owner[:5]))
-    if site_matches:
-        lines.append("按名称搜索到的未归档仓库: " + "、".join(site_matches[:5]))
-    if readme_matches:
-        lines.append("README 中出现的 GitHub 链接: " + "、".join(readme_matches[:5]))
-    text = "\n".join(lines)
-    _archive_notice_cache[key] = (now, text)
-    return text
-
-
 def _api_error(resp: httpx.Response) -> str:
     """根据 GitHub API 响应构建可读的错误信息"""
     if resp.status_code == 401:
@@ -332,10 +188,279 @@ async def _search_healthy(client: httpx.AsyncClient) -> bool:
             params={"q": "GitHub repo:github/docs", "per_page": 1},
             headers=_headers(),
         )
+        # 故障时 total_count 可能 >0 但 items 为空，必须基于 items 判定
+        return resp.status_code == 200 and bool(resp.json().get("items"))
     except Exception:
         return False
-    # 故障时 total_count 可能 >0 但 items 为空，必须基于 items 判定
-    return resp.status_code == 200 and bool(resp.json().get("items"))
+
+
+async def _repo_suggestions(client: httpx.AsyncClient, repo: str, limit: int = 3) -> str:
+    """仓库不存在时，按名字末段搜索相似仓库，返回候选列表文本（失败返回空串）"""
+    name = repo.split("/")[-1]
+    try:
+        resp = await _get(
+            client,
+            f"{API_BASE}/search/repositories",
+            params={"q": name, "per_page": limit},
+            headers=_headers(),
+        )
+        if resp.status_code != 200:
+            return ""
+        items = resp.json().get("items", [])
+    except Exception as e:
+        print(f"[github-mcp] 候选搜索失败 repo={repo} ({type(e).__name__}: {e!r})", flush=True)
+        return ""
+    if not items:
+        return ""
+    lines = ["\n相似仓库候选:"]
+    for r in items[:limit]:
+        lines.append(f"  - {r['full_name']} ⭐{r['stargazers_count']}（{r.get('language') or 'N/A'}）")
+    return "\n".join(lines)
+
+
+async def _fetch_file(
+    client: httpx.AsyncClient, repo: str, path: str, ref: str | None
+) -> tuple[bytes, str, int]:
+    """获取文件原始字节，返回 (data, sha, size)
+
+    contents API 不返回内容（大文件）时回退 raw 端点；失败抛 _ToolError。"""
+    url = f"{API_BASE}/repos/{repo}/contents/{quote(path, safe='/')}"
+    params = {"ref": ref} if ref else None
+    resp = await _get(client, url, params=params, headers=_headers())
+    if resp.status_code == 404:
+        info = await _get(client, f"{API_BASE}/repos/{repo}", headers=_headers())
+        if info.status_code == 404:
+            suggest = await _repo_suggestions(client, repo)
+            raise _ToolError(f"仓库不存在（{repo}）{suggest}")
+        if info.status_code != 200:
+            raise _ToolError(_api_error(info))
+        params = {"ref": ref or info.json()["default_branch"]}
+        resp = await _get(client, url, params=params, headers=_headers())
+    if resp.status_code != 200:
+        raise _ToolError(_api_error(resp))
+
+    body = resp.json()
+    if isinstance(body, list):
+        raise _ToolError(f"'{path}' 是目录而非文件")
+    if not isinstance(body, dict):
+        raise _ToolError("响应格式异常")
+    if body.get("encoding") == "base64":
+        data = base64.b64decode(body.get("content") or "")
+        return data, body.get("sha", ""), body.get("size", len(data))
+
+    # 大文件：contents API 返回 encoding=none，回退 raw 端点
+    raw_ref = quote(ref, safe="/") if ref else "HEAD"
+    raw = await _get(
+        client,
+        f"{RAW_BASE}/{repo}/{raw_ref}/{quote(path, safe='/')}",
+        headers=_headers(),
+        timeout=max(TIMEOUT * 3, 60),
+    )
+    if raw.status_code != 200:
+        raise _ToolError(f"文件获取失败 (HTTP {raw.status_code})")
+    return raw.content, "", len(raw.content)
+
+
+async def _resolve_tree(
+    client: httpx.AsyncClient, repo: str, ref: str | None, path: str
+) -> str:
+    """解析目录路径，返回其 tree SHA
+
+    逐层请求非递归 tree，避免 contents API 最多 1000 条的限制。"""
+    tree_ref = ref
+    if not tree_ref:
+        info = await _get(client, f"{API_BASE}/repos/{repo}", headers=_headers())
+        if info.status_code == 404:
+            suggest = await _repo_suggestions(client, repo)
+            raise _ToolError(f"仓库不存在（{repo}）{suggest}")
+        if info.status_code != 200:
+            raise _ToolError(_api_error(info))
+        tree_ref = info.json()["default_branch"]
+    if not path:
+        return tree_ref
+
+    for part in path.split("/"):
+        resp = await _get(
+            client,
+            f"{API_BASE}/repos/{repo}/git/trees/{tree_ref}",
+            headers=_headers(),
+        )
+        if resp.status_code != 200:
+            raise _ToolError(_api_error(resp))
+        entries = resp.json().get("tree", [])
+        entry = next((item for item in entries if item.get("path") == part), None)
+        if entry is None:
+            raise _ToolError(f"未找到路径 '{path}'（ref={ref or 'default'}）")
+        if entry.get("type") != "tree":
+            raise _ToolError(f"'{path}' 是文件而非目录；可用 read_code 读取")
+        tree_ref = entry["sha"]
+    return tree_ref
+
+
+_repo_meta_cache: dict[str, tuple[float, dict]] = {}
+_archive_notice_cache: dict[str, tuple[float, str]] = {}
+_REPO_META_TTL = 600  # 秒
+
+
+async def _repo_meta(client: httpx.AsyncClient, repo: str) -> dict | None:
+    """获取仓库元信息（进程内缓存，避免归档检查重复请求）"""
+    key = repo.lower()
+    now = time.time()
+    cached = _repo_meta_cache.get(key)
+    if cached and now - cached[0] < _REPO_META_TTL:
+        return cached[1]
+    try:
+        resp = await _get(client, f"{API_BASE}/repos/{repo}", headers=_headers())
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+    except Exception as e:
+        print(f"[github-mcp] 仓库元信息获取失败 repo={repo} ({type(e).__name__}: {e!r})", flush=True)
+        return None
+    _repo_meta_cache[key] = (now, data)
+    return data
+
+
+async def _readme_text(client: httpx.AsyncClient, repo: str) -> str | None:
+    """README 文本（最多 64 KiB）；没有 README 返回空串，请求失败返回 None。"""
+    try:
+        resp = await _get(client, f"{API_BASE}/repos/{repo}/readme", headers=_headers())
+        if resp.status_code == 404:
+            return ""
+        if resp.status_code != 200:
+            return None
+        content = resp.json().get("content")
+        if not content:
+            return ""
+        return base64.b64decode(content).decode("utf-8", errors="ignore")[:65536]
+    except Exception:
+        return None
+
+
+async def _owner_repos(
+    client: httpx.AsyncClient, owner: str, limit: int = 5
+) -> list[str] | None:
+    """owner（组织或用户）下最近更新的未归档仓库；请求失败返回 None。"""
+    failed = False
+    for qualifier in ("org", "user"):
+        try:
+            resp = await _get(
+                client,
+                f"{API_BASE}/search/repositories",
+                params={
+                    "q": f"{qualifier}:{owner} archived:false",
+                    "sort": "updated",
+                    "order": "desc",
+                    "per_page": limit,
+                },
+                headers=_headers(),
+            )
+        except Exception as e:
+            print(
+                f"[github-mcp] owner 仓库搜索失败 owner={owner} ({type(e).__name__}: {e!r})",
+                flush=True,
+            )
+            failed = True
+            continue
+        if resp.status_code != 200:
+            failed = True
+            continue
+        try:
+            names = [
+                item.get("full_name", "")
+                for item in resp.json().get("items", [])
+                if item.get("full_name")
+            ]
+        except Exception:
+            failed = True
+            continue
+        if names:
+            return names
+    return None if failed else []
+
+
+async def _archived_notice(
+    client: httpx.AsyncClient,
+    repo: str,
+    data: dict | None = None,
+    include_description: bool = True,
+) -> str:
+    """仓库已归档时返回警告和四类事实，否则返回空串。"""
+    meta = data or await _repo_meta(client, repo)
+    if not meta or not meta.get("archived"):
+        return ""
+
+    key = f"{repo.lower()}|{include_description}"
+    now = time.time()
+    cached = _archive_notice_cache.get(key)
+    if cached and now - cached[0] < _REPO_META_TTL:
+        return cached[1]
+
+    ok = True
+    same_owner = await _owner_repos(client, repo.split("/")[0], limit=5)
+    if same_owner is None:
+        same_owner = []
+        ok = False
+
+    reserved = {"orgs", "users", "topics", "sponsors", "marketplace", "login", "settings"}
+    site_matches: list[str] = []
+    try:
+        resp = await _get(
+            client,
+            f"{API_BASE}/search/repositories",
+            params={"q": f"{repo.split('/')[-1]} archived:false", "per_page": 5},
+            headers=_headers(),
+        )
+        if resp.status_code != 200:
+            ok = False
+        else:
+            site_matches = [
+                item.get("full_name", "")
+                for item in resp.json().get("items", [])
+                if item.get("full_name") and item.get("full_name", "").lower() != repo.lower()
+            ]
+    except Exception as e:
+        print(
+            f"[github-mcp] 全站候选搜索失败 repo={repo} ({type(e).__name__}: {e!r})",
+            flush=True,
+        )
+        ok = False
+
+    readme = await _readme_text(client, repo)
+    if readme is None:
+        readme = ""
+        ok = False
+
+    readme_matches: list[str] = []
+    for match in re.finditer(
+        r"(?<![A-Za-z0-9_.-])github\.com/([A-Za-z0-9_.-]+)(?:/([A-Za-z0-9_.-]+))?",
+        readme,
+    ):
+        org = match.group(1).rstrip(".,);]")
+        ref = (match.group(2) or "").rstrip(".,);]")
+        if org.lower() in reserved:
+            continue
+        found = f"{org}/{ref}" if ref else org
+        if found.lower() != repo.lower() and found not in readme_matches:
+            readme_matches.append(found)
+        if len(readme_matches) >= 5:
+            break
+
+    pushed = (meta.get("pushed_at") or "未知")[:10]
+    lines = [f"\n⚠ {repo} 已归档，停止更新（最后推送 {pushed}）。"]
+    desc = (meta.get("description") or "").strip()
+    if desc and include_description:
+        lines.append(f"描述: {desc[:300]}")
+    if same_owner:
+        lines.append("同 owner 的未归档仓库: " + "、".join(same_owner[:5]))
+    if site_matches:
+        lines.append("按名称搜索到的未归档仓库: " + "、".join(site_matches[:5]))
+    if readme_matches:
+        lines.append("README 中出现的 GitHub 链接: " + "、".join(readme_matches[:5]))
+    text = "\n".join(lines)
+    if ok:
+        _archive_notice_cache[key] = (now, text)
+    return text
 
 
 @mcp.tool(structured_output=False)
@@ -360,39 +485,35 @@ async def search_code(
     if path:
         q += f" path:{path}"
     per_page = max(1, min(int(limit), 50))
-    notice = ""
-    if repo:
-        async with _client() as client:
-            notice = await _archived_notice(client, repo)
+    client = _client()
+    notice = await _archived_notice(client, repo) if repo else ""
 
     try:
-        async with _client() as client:
-            resp = await _get(
-                client,
-                f"{API_BASE}/search/code",
-                params={"q": q, "per_page": per_page},
-                headers=_headers(text_match=True),
-            )
-            if resp.status_code != 200:
-                return f"搜索失败: {_api_error(resp)}"
-            data = resp.json()
-            items = data.get("items", [])
-            total = data.get("total_count", 0)
-            if not items:
-                if repo:
-                    # 搜索 API 对不存在的 repo qualifier 静默返回 0 结果，用探针区分"仓库不存在"与"无匹配"
-                    info = await _get(client, f"{API_BASE}/repos/{repo}", headers=_headers())
-                    if info.status_code == 404:
-                        suggest = await _repo_suggestions(client, repo)
-                        return f"搜索失败: 仓库不存在（{repo}）{suggest}"
-                    if info.status_code != 200:
-                        return f"搜索失败: {_api_error(info)}"
-                if not await _search_healthy(client):
-                    return "GitHub 搜索服务异常，请稍后重试或检查 GitHub 状态页"
-                return f"未找到与 '{q}' 相关的代码。" + notice
+        resp = await _get(
+            client,
+            f"{API_BASE}/search/code",
+            params={"q": q, "per_page": per_page},
+            headers=_headers(text_match=True),
+        )
+        if resp.status_code != 200:
+            return f"搜索失败: {_api_error(resp)}"
+        data = resp.json()
+        items = data.get("items", [])
+        total = data.get("total_count", 0)
+        if not items:
+            if repo:
+                # 搜索 API 对不存在的 repo qualifier 静默返回 0 结果，用探针区分"仓库不存在"与"无匹配"
+                info = await _get(client, f"{API_BASE}/repos/{repo}", headers=_headers())
+                if info.status_code == 404:
+                    suggest = await _repo_suggestions(client, repo)
+                    return f"搜索失败: 仓库不存在（{repo}）{suggest}"
+                if info.status_code != 200:
+                    return f"搜索失败: {_api_error(info)}"
+            if not await _search_healthy(client):
+                return "GitHub 搜索服务异常，请稍后重试或检查 GitHub 状态页"
+            return f"未找到与 '{q}' 相关的代码。" + notice
     except Exception as e:
-        cause = f" cause={e.__cause__!r}" if e.__cause__ else ""
-        return f"搜索失败: API 服务不可用 ({type(e).__name__}: {e!r}{cause})"
+        return f"搜索失败: {_transport_error(e)}"
 
     lines = [f"搜索 '{q}' 的结果，共 {total} 处匹配（显示前 {len(items)} 条）:\n"]
     for i, item in enumerate(items, 1):
@@ -420,16 +541,14 @@ async def search_repo(
     （如组织名拼写不确定时纠错）。"""
     per_page = max(1, min(int(limit), 50))
     try:
-        async with _client() as client:
-            resp = await _get(
-                client,
-                f"{API_BASE}/search/repositories",
-                params={"q": query, "per_page": per_page},
-                headers=_headers(),
-            )
+        resp = await _get(
+            _client(),
+            f"{API_BASE}/search/repositories",
+            params={"q": query, "per_page": per_page},
+            headers=_headers(),
+        )
     except Exception as e:
-        cause = f" cause={e.__cause__!r}" if e.__cause__ else ""
-        return f"搜索失败: API 服务不可用 ({type(e).__name__}: {e!r}{cause})"
+        return f"搜索失败: {_transport_error(e)}"
 
     if resp.status_code != 200:
         return f"搜索失败: {_api_error(resp)}"
@@ -463,15 +582,14 @@ async def get_repo(
 
     返回仓库全名、可见性、默认分支、star 数、语言、描述等元信息。
     仓库不存在时给出明确提示。"""
+    client = _client()
     try:
-        async with _client() as client:
-            resp = await _get(client, f"{API_BASE}/repos/{repo}", headers=_headers())
-            if resp.status_code == 404:
-                suggest = await _repo_suggestions(client, repo)
-                return f"仓库不存在（{repo}）{suggest}"
+        resp = await _get(client, f"{API_BASE}/repos/{repo}", headers=_headers())
+        if resp.status_code == 404:
+            suggest = await _repo_suggestions(client, repo)
+            return f"仓库不存在（{repo}）{suggest}"
     except Exception as e:
-        cause = f" cause={e.__cause__!r}" if e.__cause__ else ""
-        return f"查询失败: API 服务不可用 ({type(e).__name__}: {e!r}{cause})"
+        return f"查询失败: {_transport_error(e)}"
     if resp.status_code != 200:
         return f"查询失败: {_api_error(resp)}"
 
@@ -493,8 +611,7 @@ async def get_repo(
     lines.append(f"推送时间: {r.get('pushed_at')}")
     lines.append(f"更新时间: {r.get('updated_at')}")
     if r.get("archived"):
-        async with _client() as client:
-            lines.append(await _archived_notice(client, repo, r, include_description=False))
+        lines.append(await _archived_notice(client, repo, r, include_description=False))
     return "\n".join(lines)
 
 
@@ -512,105 +629,27 @@ async def list_tree(
     用于浏览仓库结构后定位文件路径。"""
     limit = max(1, min(int(limit), 1000))
     prefix = (path or "").strip("/")
-    async with _client() as client:
-        notice = await _archived_notice(client, repo)
-
-    if depth == 1:
-        # 只列一层：contents API 直接列目标目录
-        contents_url = f"{API_BASE}/repos/{repo}/contents"
-        if prefix:
-            contents_url += f"/{quote(prefix, safe='/')}"
-        try:
-            async with _client() as client:
-                resp = await _get(
-                    client,
-                    contents_url,
-                    params={"ref": ref} if ref else None,
-                    headers=_headers(),
-                )
-        except Exception as e:
-            cause = f" cause={e.__cause__!r}" if e.__cause__ else ""
-            return f"查询失败: API 服务不可用 ({type(e).__name__}: {e!r}{cause})"
-        if resp.status_code == 404:
-            return f"未找到路径 '{prefix or '/'}'（ref={ref or 'default'}）"
-        if resp.status_code != 200:
-            return f"查询失败: {_api_error(resp)}"
-        body = resp.json()
-        if not isinstance(body, list):
-            return f"'{prefix}' 是文件而非目录；可用 read_code 读取"
-        shown = body[:limit]
-        lines = [
-            f"# {repo} — {prefix or '/'}（ref={ref or 'default'}，"
-            f"共 {len(body)} 项，显示 {len(shown)} 条）:\n"
-        ]
-        for it in shown:
-            name = it.get("name", "")
-            p = f"{prefix}/{name}" if prefix else name
-            if it.get("type") == "dir":
-                lines.append(f"{p}/")
-            else:
-                size = it.get("size")
-                lines.append(f"{p}" + (f" ({size} B)" if size is not None else ""))
-        if len(body) > limit:
-            lines.append(f"\n... 还有 {len(body) - limit} 项，可用 limit 调整")
-        return "\n".join(lines) + notice
-
-    # 多层：path 非空时先经父目录拿到目标目录自身的 tree SHA，只拉取该子树的树；
-    # path 为空时拉取 ref 的全量树
-    tree_ref = ref
-    if prefix:
-        parent, _, name = prefix.rpartition("/")
-        contents_url = f"{API_BASE}/repos/{repo}/contents"
-        if parent:
-            contents_url += f"/{quote(parent, safe='/')}"
-        try:
-            async with _client() as client:
-                listing = await _get(
-                    client,
-                    contents_url,
-                    params={"ref": ref} if ref else None,
-                    headers=_headers(),
-                )
-        except Exception as e:
-            cause = f" cause={e.__cause__!r}" if e.__cause__ else ""
-            return f"查询失败: API 服务不可用 ({type(e).__name__}: {e!r}{cause})"
-        if listing.status_code == 404:
-            return f"未找到路径 '{prefix}'（ref={ref or 'default'}）"
-        if listing.status_code != 200:
-            return f"查询失败: {_api_error(listing)}"
-        entries = listing.json()
-        if not isinstance(entries, list):
-            return f"未找到路径 '{prefix}'（ref={ref or 'default'}）"
-        entry = next((it for it in entries if it.get("name") == name), None)
-        if entry is None:
-            return f"未找到路径 '{prefix}'（ref={ref or 'default'}）"
-        if entry.get("type") != "dir":
-            return f"'{prefix}' 是文件而非目录；可用 read_code 读取"
-        tree_ref = entry["sha"]
+    client = _client()
+    notice = await _archived_notice(client, repo)
 
     try:
-        async with _client() as client:
-            if not tree_ref:
-                info = await _get(client, f"{API_BASE}/repos/{repo}", headers=_headers())
-                if info.status_code != 200:
-                    return f"查询失败: {_api_error(info)}"
-                tree_ref = info.json()["default_branch"]
-            resp = await _get(
-                client,
-                f"{API_BASE}/repos/{repo}/git/trees/{tree_ref}",
-                params={"recursive": "1"},
-                headers=_headers(),
-            )
+        tree_ref = await _resolve_tree(client, repo, ref, prefix)
+        resp = await _get(
+            client,
+            f"{API_BASE}/repos/{repo}/git/trees/{tree_ref}",
+            params={"recursive": "1"} if depth != 1 else None,
+            headers=_headers(),
+        )
+        if resp.status_code == 404:
+            return f"查询失败: 仓库或 ref 不存在（{repo}@{ref or 'default'}）"
+        if resp.status_code != 200:
+            return f"查询失败: {_api_error(resp)}"
+        data = resp.json()
+    except _ToolError as e:
+        return f"查询失败: {e}"
     except Exception as e:
-        cause = f" cause={e.__cause__!r}" if e.__cause__ else ""
-        return f"查询失败: API 服务不可用 ({type(e).__name__}: {e!r}{cause})"
+        return f"查询失败: {_transport_error(e)}"
 
-    if resp.status_code == 404:
-        return f"仓库或 ref 不存在（{repo}@{ref or 'default'}）"
-    if resp.status_code != 200:
-        return f"查询失败: {_api_error(resp)}"
-
-    data = resp.json()
     truncated = data.get("truncated", False)
     base = f"{prefix}/" if prefix else ""
     items = []
@@ -623,10 +662,9 @@ async def list_tree(
             items.append(f"{full}/")
         else:
             size = item.get("size")
-            size_str = f" ({size} B)" if size is not None else ""
-            items.append(f"{full}{size_str}")
+            items.append(f"{full}" + (f" ({size} B)" if size is not None else ""))
     if not items:
-        return f"未找到路径 '{path or ''}'（ref={ref or 'default'}）"
+        return f"未找到路径 '{prefix or '/'}'（ref={ref or 'default'}）"
     shown = items[:limit]
     lines = [
         f"# {repo} 文件树（ref={ref or 'default'}，共 {len(items)} 项，显示 {len(shown)} 条"
@@ -653,65 +691,29 @@ async def read_code(
     便于定位任意一行代码。返回带行号的源码和文件元信息。"""
     start_line = max(1, int(start_line))
     max_lines = max(1, min(int(max_lines), MAX_LINES))
-    async with _client() as client:
-        notice = await _archived_notice(client, repo)
+    client = _client()
+    notice = await _archived_notice(client, repo)
 
     try:
-        async with _client() as client:
-            url = f"{API_BASE}/repos/{repo}/contents/{path}"
-            params = {"ref": ref} if ref else None
-            resp = await _get(client, url, params=params, headers=_headers())
-
-            if resp.status_code == 404:
-                # GitHub 对无权限资源伪装 404，用仓库元信息探针区分"仓库不存在"与"路径不存在"
-                info = await _get(client, f"{API_BASE}/repos/{repo}", headers=_headers())
-                if info.status_code == 404:
-                    suggest = await _repo_suggestions(client, repo)
-                    return f"读取失败: 仓库不存在（{repo}）{suggest}"
-                if info.status_code != 200:
-                    return f"读取失败: {_api_error(info)}"
-                params = {"ref": ref or info.json()["default_branch"]}
-                resp = await _get(client, url, params=params, headers=_headers())
+        data, sha, size = await _fetch_file(client, repo, path, ref)
+    except _ToolError as e:
+        return f"读取失败: {e}"
     except Exception as e:
-        cause = f" cause={e.__cause__!r}" if e.__cause__ else ""
-        return f"读取失败: API 服务不可用 ({type(e).__name__}: {e!r}{cause})"
+        return f"读取失败: {_transport_error(e)}"
 
-    if resp.status_code == 404:
-        return "读取失败: 文件路径或 ref 不存在（请检查 path/ref 参数）"
-    if resp.status_code != 200:
-        return f"读取失败: {_api_error(resp)}"
-
-    body = resp.json()
-    content = body.get("content")
-    if content is None:
-        # 文件超过 1 MiB 时 contents API 只返回 blob 链接，回退 raw 端点
-        try:
-            async with _client() as client:
-                raw = await _get(
-                    client,
-                    f"{RAW_BASE}/{repo}/{ref or 'HEAD'}/{path}",
-                    timeout=max(TIMEOUT * 3, 60),
-                )
-        except Exception as e:
-            cause = f" cause={e.__cause__!r}" if e.__cause__ else ""
-            return f"读取失败: API 服务不可用 ({type(e).__name__}: {e!r}{cause})"
-        if raw.status_code != 200:
-            return f"读取失败: 文件获取失败 (HTTP {raw.status_code})"
-        text = raw.text
-        sha = ""
-        size = len(raw.content)
-    else:
-        text = base64.b64decode(content).decode("utf-8", errors="replace")
-        sha = body.get("sha", "")
-        size = body.get("size", len(text))
-
+    if len(data) > READ_MAX_BYTES:
+        return (
+            f"读取失败: 文件过大（{len(data)} B，上限 {READ_MAX_BYTES // (1024 * 1024)} MiB），"
+            "请用 grep 或 download"
+        )
+    text = data.decode("utf-8", errors="replace")
     all_lines = text.splitlines()
     total = len(all_lines)
     if start_line > total:
         return (
             f"# {repo} — {path}\n"
             f"ref={ref or 'default'}  | 共 {total} 行  | start_line={start_line} 超出文件范围"
-        )
+        ) + notice
     end = min(start_line - 1 + max_lines, total)
     selected = all_lines[start_line - 1 : end]
     width = len(str(end))
@@ -748,58 +750,14 @@ async def download(
     except ValueError as e:
         return f"下载失败: {e}"
 
-    async with _client() as client:
-        notice = await _archived_notice(client, repo)
-
+    client = _client()
+    notice = await _archived_notice(client, repo)
     try:
-        async with _client() as client:
-            url = f"{API_BASE}/repos/{repo}/contents/{quote(path, safe='/')}"
-            params = {"ref": ref} if ref else None
-            resp = await _get(client, url, params=params, headers=_headers())
-            if resp.status_code == 404:
-                # GitHub 对无权限资源伪装 404，用仓库元信息探针区分"仓库不存在"与"路径不存在"
-                info = await _get(client, f"{API_BASE}/repos/{repo}", headers=_headers())
-                if info.status_code == 404:
-                    suggest = await _repo_suggestions(client, repo)
-                    return f"下载失败: 仓库不存在（{repo}）{suggest}"
-                if info.status_code != 200:
-                    return f"下载失败: {_api_error(info)}"
-                params = {"ref": ref or info.json()["default_branch"]}
-                resp = await _get(client, url, params=params, headers=_headers())
-            if resp.status_code != 200:
-                return f"下载失败: {_api_error(resp)}"
-
-            body = resp.json()
-            if isinstance(body, list):
-                return f"下载失败: '{path}' 是目录而非文件（可用 list_tree 查看目录内容）"
-
-            encoding = body.get("encoding")
-            content = body.get("content")
-            sha = body.get("sha", "")
-            if encoding == "base64":
-                # 空文件 content 也是 ""，这里的 or "" 兼容两种空值
-                data = base64.b64decode(content or "")
-            else:
-                # 文件超过 1 MiB 时 contents API 只返回 blob 链接（encoding=none），回退 raw 端点
-                raw_ref = quote(ref, safe="/") if ref else "HEAD"
-                try:
-                    async with _client() as raw_client:
-                        raw = await _get(
-                            raw_client,
-                            f"{RAW_BASE}/{repo}/{raw_ref}/{quote(path, safe='/')}",
-                            headers=_headers(),
-                            timeout=max(TIMEOUT * 3, 60),
-                        )
-                except Exception as e:
-                    cause = f" cause={e.__cause__!r}" if e.__cause__ else ""
-                    return f"下载失败: API 服务不可用 ({type(e).__name__}: {e!r}{cause})"
-                if raw.status_code != 200:
-                    return f"下载失败: 文件获取失败 (HTTP {raw.status_code})"
-                data = raw.content
-                sha = ""
+        data, sha, _ = await _fetch_file(client, repo, path, ref)
+    except _ToolError as e:
+        return f"下载失败: {e}"
     except Exception as e:
-        cause = f" cause={e.__cause__!r}" if e.__cause__ else ""
-        return f"下载失败: API 服务不可用 ({type(e).__name__}: {e!r}{cause})"
+        return f"下载失败: {_transport_error(e)}"
 
     try:
         os.makedirs(os.path.dirname(dest), exist_ok=True)
@@ -813,6 +771,10 @@ async def download(
         f"保存到: {dest}\n"
         f"ref={ref or 'default'}  | 大小 {len(data)} B  | sha={sha[:12] or 'N/A'}"
     ) + notice
+
+
+def _grep_lines(text: str, regex: re.Pattern) -> list[tuple[int, str]]:
+    return [(i, line) for i, line in enumerate(text.splitlines(), 1) if regex.search(line)]
 
 
 @mcp.tool(structured_output=False)
@@ -833,55 +795,30 @@ async def grep(
     except re.error as e:
         return f"grep 失败: 无效的正则表达式（{e}）"
 
-    async with _client() as client:
-        notice = await _archived_notice(client, repo)
-
+    client = _client()
+    notice = await _archived_notice(client, repo)
     try:
-        async with _client() as client:
-            url = f"{API_BASE}/repos/{repo}/contents/{quote(path, safe='/')}"
-            params = {"ref": ref} if ref else None
-            resp = await _get(client, url, params=params, headers=_headers())
-            if resp.status_code == 404:
-                info = await _get(client, f"{API_BASE}/repos/{repo}", headers=_headers())
-                if info.status_code == 404:
-                    suggest = await _repo_suggestions(client, repo)
-                    return f"grep 失败: 仓库不存在（{repo}）{suggest}"
-                if info.status_code != 200:
-                    return f"grep 失败: {_api_error(info)}"
-                params = {"ref": ref or info.json()["default_branch"]}
-                resp = await _get(client, url, params=params, headers=_headers())
-            if resp.status_code != 200:
-                return f"grep 失败: {_api_error(resp)}"
-
-            body = resp.json()
-            if isinstance(body, list):
-                return f"grep 失败: '{path}' 是目录而非文件"
-            sha = body.get("sha", "")
-            size = body.get("size", 0)
-            if body.get("encoding") == "base64":
-                data = base64.b64decode(body.get("content") or "")
-            else:
-                raw_ref = quote(ref, safe="/") if ref else "HEAD"
-                async with _client() as raw_client:
-                    raw = await _get(
-                        raw_client,
-                        f"{RAW_BASE}/{repo}/{raw_ref}/{quote(path, safe='/')}",
-                        headers=_headers(),
-                        timeout=max(TIMEOUT * 3, 60),
-                    )
-                if raw.status_code != 200:
-                    return f"grep 失败: 文件获取失败 (HTTP {raw.status_code})"
-                data = raw.content
-                sha = ""
-                size = len(data)
+        data, sha, size = await _fetch_file(client, repo, path, ref)
+    except _ToolError as e:
+        return f"grep 失败: {e}"
     except Exception as e:
-        cause = f" cause={e.__cause__!r}" if e.__cause__ else ""
-        return f"grep 失败: API 服务不可用 ({type(e).__name__}: {e!r}{cause})"
+        return f"grep 失败: {_transport_error(e)}"
 
+    if len(data) > GREP_MAX_BYTES:
+        return (
+            f"grep 失败: 文件过大（{len(data)} B，上限 {GREP_MAX_BYTES // (1024 * 1024)} MiB），"
+            "请缩小搜索范围"
+        )
     if b"\x00" in data[:4096]:
         return f"grep 失败: '{path}' 是二进制文件"
-    lines = data.decode("utf-8", errors="replace").splitlines()
-    matches = [(i, line) for i, line in enumerate(lines, 1) if regex.search(line)]
+
+    text = data.decode("utf-8", errors="replace")
+    try:
+        matches = await asyncio.wait_for(
+            asyncio.to_thread(_grep_lines, text, regex), timeout=GREP_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        return f"grep 失败: 正则匹配超时（>{GREP_TIMEOUT:.0f}s），请简化 pattern"
     if not matches:
         return f"在 {repo} — {path} 中未找到匹配 '{pattern}' 的行。" + notice
 
@@ -889,7 +826,7 @@ async def grep(
     width = len(str(shown[-1][0]))
     out = [
         f"# {repo} — {path}（匹配 {len(matches)} 行，显示前 {len(shown)} 条）",
-        f"ref={ref or 'default'}  | 共 {len(lines)} 行  | sha={sha[:12] or 'N/A'}  | size={size}",
+        f"ref={ref or 'default'}  | 共 {len(text.splitlines())} 行  | sha={sha[:12] or 'N/A'}  | size={size}",
         "",
     ]
     out.extend(f"{i:>{width}} | {line}" for i, line in shown)
