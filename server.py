@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import os
+import re
 import time
 from typing import Annotated
 from urllib.parse import quote
@@ -150,6 +151,155 @@ def _headers(*, text_match: bool = False) -> dict[str, str]:
     return headers
 
 
+_repo_meta_cache: dict[str, tuple[float, dict]] = {}
+_archive_notice_cache: dict[str, tuple[float, str]] = {}
+_REPO_META_TTL = 600  # 秒
+
+
+async def _repo_meta(client: httpx.AsyncClient, repo: str) -> dict | None:
+    """获取仓库元信息（进程内缓存，避免归档检查重复请求）"""
+    key = repo.lower()
+    now = time.time()
+    cached = _repo_meta_cache.get(key)
+    if cached and now - cached[0] < _REPO_META_TTL:
+        return cached[1]
+    try:
+        resp = await _get(client, f"{API_BASE}/repos/{repo}", headers=_headers())
+    except Exception as e:
+        print(f"[github-mcp] 仓库元信息获取失败 repo={repo} ({type(e).__name__}: {e!r})", flush=True)
+        return None
+    if resp.status_code != 200:
+        return None
+    data = resp.json()
+    _repo_meta_cache[key] = (now, data)
+    return data
+
+
+async def _readme_text(client: httpx.AsyncClient, repo: str) -> str:
+    """读取默认分支 README 的文本内容（最多 64 KiB），失败返回空串"""
+    try:
+        resp = await _get(client, f"{API_BASE}/repos/{repo}/readme", headers=_headers())
+    except Exception:
+        return ""
+    if resp.status_code != 200:
+        return ""
+    try:
+        content = resp.json().get("content")
+        if not content:
+            return ""
+        return base64.b64decode(content).decode("utf-8", errors="ignore")[:65536]
+    except Exception:
+        return ""
+
+
+async def _owner_repos(client: httpx.AsyncClient, owner: str, limit: int = 5) -> list[str]:
+    """列出 owner（组织或用户）下最近更新的未归档仓库"""
+    for qualifier in ("org", "user"):
+        try:
+            resp = await _get(
+                client,
+                f"{API_BASE}/search/repositories",
+                params={
+                    "q": f"{qualifier}:{owner} archived:false",
+                    "sort": "updated",
+                    "order": "desc",
+                    "per_page": limit,
+                },
+                headers=_headers(),
+            )
+        except Exception as e:
+            print(
+                f"[github-mcp] owner 仓库搜索失败 owner={owner} ({type(e).__name__}: {e!r})",
+                flush=True,
+            )
+            continue
+        if resp.status_code == 200:
+            names = [
+                r.get("full_name", "")
+                for r in resp.json().get("items", [])
+                if r.get("full_name")
+            ]
+            if names:
+                return names
+    return []
+
+
+async def _archived_notice(
+    client: httpx.AsyncClient,
+    repo: str,
+    data: dict | None = None,
+    include_description: bool = True,
+) -> str:
+    """仓库已归档时返回警告和未归档候选，否则返回空串"""
+    meta = data or await _repo_meta(client, repo)
+    if not meta or not meta.get("archived"):
+        return ""
+
+    key = repo.lower()
+    now = time.time()
+    cached = _archive_notice_cache.get(key)
+    if cached and now - cached[0] < _REPO_META_TTL:
+        return cached[1]
+
+    reserved = {"orgs", "users", "topics", "sponsors", "marketplace", "login", "settings"}
+    owner = repo.split("/")[0]
+    name = repo.split("/")[-1]
+
+    # 同 owner 的未归档仓库
+    same_owner = await _owner_repos(client, owner, limit=5)
+
+    # 全站按名称匹配的未归档仓库
+    site_matches: list[str] = []
+    try:
+        resp = await _get(
+            client,
+            f"{API_BASE}/search/repositories",
+            params={"q": f"{name} archived:false", "per_page": 5},
+            headers=_headers(),
+        )
+        if resp.status_code == 200:
+            for item in resp.json().get("items", []):
+                full_name = item.get("full_name", "")
+                if full_name and full_name.lower() != key:
+                    site_matches.append(full_name)
+    except Exception as e:
+        print(
+            f"[github-mcp] 全站候选搜索失败 repo={repo} ({type(e).__name__}: {e!r})",
+            flush=True,
+        )
+
+    # README 中出现的 GitHub 仓库链接
+    readme_matches: list[str] = []
+    readme = await _readme_text(client, repo)
+    for match in re.finditer(
+        r"github\.com/([A-Za-z0-9_.-]+)(?:/([A-Za-z0-9_.-]+))?", readme
+    ):
+        org = match.group(1).rstrip(".,);]")
+        ref = (match.group(2) or "").rstrip(".,);]")
+        if org.lower() in reserved:
+            continue
+        found = f"{org}/{ref}" if ref else org
+        if found.lower() != key and found not in readme_matches:
+            readme_matches.append(found)
+        if len(readme_matches) >= 5:
+            break
+
+    pushed = (meta.get("pushed_at") or "未知")[:10]
+    lines = [f"\n⚠ {repo} 已归档，停止更新（最后推送 {pushed}）。"]
+    desc = (meta.get("description") or "").strip()
+    if desc and include_description:
+        lines.append(f"描述: {desc[:300]}")
+    if same_owner:
+        lines.append("同 owner 的未归档仓库: " + "、".join(same_owner[:5]))
+    if site_matches:
+        lines.append("按名称搜索到的未归档仓库: " + "、".join(site_matches[:5]))
+    if readme_matches:
+        lines.append("README 中出现的 GitHub 链接: " + "、".join(readme_matches[:5]))
+    text = "\n".join(lines)
+    _archive_notice_cache[key] = (now, text)
+    return text
+
+
 def _api_error(resp: httpx.Response) -> str:
     """根据 GitHub API 响应构建可读的错误信息"""
     if resp.status_code == 401:
@@ -188,7 +338,7 @@ async def _search_healthy(client: httpx.AsyncClient) -> bool:
     return resp.status_code == 200 and bool(resp.json().get("items"))
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 async def search_code(
     query: Annotated[str, Field(description="搜索关键词，GitHub code search 语法，例如 'fun Any?.toString'。高级限定符也可直接内联传入（如 'foo in:file'）。引号用法：空格分隔=多词 AND（词序不限）；双引号=精确短语（词序固定，如 '\"const val size\"'）；连字符开头=排除该词（带连字符的词需加引号，如 '\"-gx\"'）；无法直接搜索引号字符本身（引号是语法定界符，代码内的引号被忽略）")],
     repo: Annotated[str | None, Field(description="限定仓库，格式 owner/name，例如 'JetBrains/kotlin'。不传则搜索全 GitHub 所有仓库")] = None,
@@ -210,6 +360,10 @@ async def search_code(
     if path:
         q += f" path:{path}"
     per_page = max(1, min(int(limit), 50))
+    notice = ""
+    if repo:
+        async with _client() as client:
+            notice = await _archived_notice(client, repo)
 
     try:
         async with _client() as client:
@@ -235,7 +389,7 @@ async def search_code(
                         return f"搜索失败: {_api_error(info)}"
                 if not await _search_healthy(client):
                     return "GitHub 搜索服务异常，请稍后重试或检查 GitHub 状态页"
-                return f"未找到与 '{q}' 相关的代码。"
+                return f"未找到与 '{q}' 相关的代码。" + notice
     except Exception as e:
         cause = f" cause={e.__cause__!r}" if e.__cause__ else ""
         return f"搜索失败: API 服务不可用 ({type(e).__name__}: {e!r}{cause})"
@@ -252,10 +406,10 @@ async def search_code(
                 for fl in fragment.splitlines()[:5]:
                     lines.append(f"   > {fl}")
         lines.append("")
-    return "\n".join(lines)
+    return "\n".join(lines) + notice
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 async def search_repo(
     query: Annotated[str, Field(description="仓库名关键词，例如 'kotlinx-io' 或 'ktor'")],
     limit: Annotated[int, Field(description="返回结果数量，默认 5，最大 50")] = 5,
@@ -286,16 +440,22 @@ async def search_repo(
 
     lines = [f"搜索仓库 '{query}' 的结果（{resp.json().get('total_count', 0)} 处匹配，显示前 {len(items)} 条）:\n"]
     for i, r in enumerate(items, 1):
-        lines.append(f"{i}. **{r['full_name']}** ⭐{r['stargazers_count']} ({r.get('language') or 'N/A'})")
+        archived = "（已归档）" if r.get("archived") else ""
+        lines.append(
+            f"{i}. **{r['full_name']}** ⭐{r['stargazers_count']} "
+            f"({r.get('language') or 'N/A'}){archived}"
+        )
         lines.append(f"   {r['html_url']}")
         desc = (r.get("description") or "").strip()
         if desc:
             lines.append(f"   {desc[:120]}")
         lines.append("")
+    if any(r.get("archived") for r in items):
+        lines.append("⚠ 结果中包含已归档仓库（已停止更新）。")
     return "\n".join(lines)
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 async def get_repo(
     repo: Annotated[str, Field(description="仓库名，格式 owner/name，例如 'Kotlin/kotlinx-io'")],
 ) -> str:
@@ -319,7 +479,8 @@ async def get_repo(
     lines = [
         f"# {r['full_name']}",
         f"可见性: {'private' if r.get('private') else 'public'}  | 默认分支: {r.get('default_branch')}  | "
-        f"⭐{r.get('stargazers_count', 0)}  | 语言: {r.get('language') or 'N/A'}",
+        f"⭐{r.get('stargazers_count', 0)}  | 语言: {r.get('language') or 'N/A'}  | "
+        f"归档: {'是' if r.get('archived') else '否'}",
         f"URL: {r['html_url']}",
     ]
     desc = (r.get("description") or "").strip()
@@ -331,10 +492,13 @@ async def get_repo(
     lines.append(f"创建时间: {r.get('created_at')}")
     lines.append(f"推送时间: {r.get('pushed_at')}")
     lines.append(f"更新时间: {r.get('updated_at')}")
+    if r.get("archived"):
+        async with _client() as client:
+            lines.append(await _archived_notice(client, repo, r, include_description=False))
     return "\n".join(lines)
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 async def list_tree(
     repo: Annotated[str, Field(description="仓库名，格式 owner/name，例如 'Kotlin/kotlinx-io'")],
     ref: Annotated[str | None, Field(description="分支、标签或 commit SHA。不传则使用仓库默认分支")] = None,
@@ -348,6 +512,8 @@ async def list_tree(
     用于浏览仓库结构后定位文件路径。"""
     limit = max(1, min(int(limit), 1000))
     prefix = (path or "").strip("/")
+    async with _client() as client:
+        notice = await _archived_notice(client, repo)
 
     if depth == 1:
         # 只列一层：contents API 直接列目标目录
@@ -387,7 +553,7 @@ async def list_tree(
                 lines.append(f"{p}" + (f" ({size} B)" if size is not None else ""))
         if len(body) > limit:
             lines.append(f"\n... 还有 {len(body) - limit} 项，可用 limit 调整")
-        return "\n".join(lines)
+        return "\n".join(lines) + notice
 
     # 多层：path 非空时先经父目录拿到目标目录自身的 tree SHA，只拉取该子树的树；
     # path 为空时拉取 ref 的全量树
@@ -470,10 +636,10 @@ async def list_tree(
     lines.extend(shown)
     if len(items) > limit:
         lines.append(f"\n... 还有 {len(items) - limit} 项，可用 path/depth 参数缩小范围")
-    return "\n".join(lines)
+    return "\n".join(lines) + notice
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 async def read_code(
     repo: Annotated[str, Field(description="仓库名，格式 owner/name，例如 'JetBrains/kotlin'")],
     path: Annotated[str, Field(description="文件路径，例如 'libraries/stdlib/src/kotlin/kotlin.kt'")],
@@ -487,6 +653,8 @@ async def read_code(
     便于定位任意一行代码。返回带行号的源码和文件元信息。"""
     start_line = max(1, int(start_line))
     max_lines = max(1, min(int(max_lines), MAX_LINES))
+    async with _client() as client:
+        notice = await _archived_notice(client, repo)
 
     try:
         async with _client() as client:
@@ -553,7 +721,7 @@ async def read_code(
         f"ref={ref or 'default'}  | 共 {total} 行  | 显示 {start_line}-{end}  | sha={sha[:12]}  | size={size}",
     ]
     out.extend(f"{i:>{width}} | {line}" for i, line in enumerate(selected, start_line))
-    return "\n".join(out)
+    return "\n".join(out) + notice
 
 
 def _dest_path(repo: str, path: str) -> str:
@@ -565,7 +733,7 @@ def _dest_path(repo: str, path: str) -> str:
     return os.path.normpath(os.path.join(DOWNLOAD_ROOT, *parts, path.lstrip("/")))
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 async def download(
     repo: Annotated[str, Field(description="仓库名，格式 owner/name，例如 'JetBrains/kotlin'")],
     path: Annotated[str, Field(description="文件在仓库中的路径，例如 'libraries/stdlib/src/kotlin/Library.kt'")],
@@ -579,6 +747,9 @@ async def download(
         dest = _dest_path(repo, path)
     except ValueError as e:
         return f"下载失败: {e}"
+
+    async with _client() as client:
+        notice = await _archived_notice(client, repo)
 
     try:
         async with _client() as client:
@@ -641,7 +812,7 @@ async def download(
         f"已下载 {repo} — {path}\n"
         f"保存到: {dest}\n"
         f"ref={ref or 'default'}  | 大小 {len(data)} B  | sha={sha[:12] or 'N/A'}"
-    )
+    ) + notice
 
 
 if __name__ == "__main__":

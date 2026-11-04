@@ -10,6 +10,7 @@ services:
     container_name: github-mcp
     image: github-mcp
     restart: unless-stopped
+    stop_grace_period: 5s
     network_mode: host
     volumes:
       - /tmp/github-mcp:/tmp/github-mcp
