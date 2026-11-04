@@ -219,11 +219,16 @@ async def _repo_suggestions(client: httpx.AsyncClient, repo: str, limit: int = 3
 
 
 async def _fetch_file(
-    client: httpx.AsyncClient, repo: str, path: str, ref: str | None
+    client: httpx.AsyncClient,
+    repo: str,
+    path: str,
+    ref: str | None,
+    max_bytes: int | None = None,
 ) -> tuple[bytes, str, int]:
     """获取文件原始字节，返回 (data, sha, size)
 
-    contents API 不返回内容（大文件）时回退 raw 端点；失败抛 _ToolError。"""
+    contents API 不返回内容（大文件）时回退 raw 端点；超过 max_bytes 直接拒绝；
+    失败抛 _ToolError。"""
     url = f"{API_BASE}/repos/{repo}/contents/{quote(path, safe='/')}"
     params = {"ref": ref} if ref else None
     resp = await _get(client, url, params=params, headers=_headers())
@@ -244,6 +249,12 @@ async def _fetch_file(
         raise _ToolError(f"'{path}' 是目录而非文件")
     if not isinstance(body, dict):
         raise _ToolError("响应格式异常")
+    size_hint = body.get("size")
+    if max_bytes is not None and isinstance(size_hint, int) and size_hint > max_bytes:
+        raise _ToolError(
+            f"文件过大（{size_hint} B，上限 {max_bytes // (1024 * 1024)} MiB），"
+            "请用 download 下载后查看"
+        )
     if body.get("encoding") == "base64":
         data = base64.b64decode(body.get("content") or "")
         return data, body.get("sha", ""), body.get("size", len(data))
@@ -258,7 +269,7 @@ async def _fetch_file(
     )
     if raw.status_code != 200:
         raise _ToolError(f"文件获取失败 (HTTP {raw.status_code})")
-    return raw.content, "", len(raw.content)
+    return raw.content, body.get("sha", ""), len(raw.content)
 
 
 async def _resolve_tree(
@@ -695,7 +706,7 @@ async def read_code(
     notice = await _archived_notice(client, repo)
 
     try:
-        data, sha, size = await _fetch_file(client, repo, path, ref)
+        data, sha, size = await _fetch_file(client, repo, path, ref, max_bytes=READ_MAX_BYTES)
     except _ToolError as e:
         return f"读取失败: {e}"
     except Exception as e:
@@ -704,7 +715,7 @@ async def read_code(
     if len(data) > READ_MAX_BYTES:
         return (
             f"读取失败: 文件过大（{len(data)} B，上限 {READ_MAX_BYTES // (1024 * 1024)} MiB），"
-            "请用 grep 或 download"
+            "请用 download 下载后查看"
         )
     text = data.decode("utf-8", errors="replace")
     all_lines = text.splitlines()
@@ -798,7 +809,7 @@ async def grep(
     client = _client()
     notice = await _archived_notice(client, repo)
     try:
-        data, sha, size = await _fetch_file(client, repo, path, ref)
+        data, sha, size = await _fetch_file(client, repo, path, ref, max_bytes=GREP_MAX_BYTES)
     except _ToolError as e:
         return f"grep 失败: {e}"
     except Exception as e:
@@ -807,7 +818,7 @@ async def grep(
     if len(data) > GREP_MAX_BYTES:
         return (
             f"grep 失败: 文件过大（{len(data)} B，上限 {GREP_MAX_BYTES // (1024 * 1024)} MiB），"
-            "请缩小搜索范围"
+            "请用 download 下载后本地搜索"
         )
     if b"\x00" in data[:4096]:
         return f"grep 失败: '{path}' 是二进制文件"
