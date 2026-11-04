@@ -12,6 +12,7 @@
 | `list_tree` | 获取仓库文件树，支持按子目录、深度和条目数过滤 |
 | `read_code` | 读取任意仓库任意文件：支持分支/标签/commit 指定、按行范围读取（任意一行代码） |
 | `download` | 下载任意仓库文件到本地：`/tmp/github-mcp/<owner>/<repo>/<仓库内路径>`，按原始字节保存 |
+| `grep` | 在单个文件内按正则逐行搜索，返回匹配行号和整行内容 |
 
 ## 快速开始（Docker Compose）
 
@@ -63,6 +64,7 @@ claude mcp add --transport http github-mcp http://localhost:8000/mcp
 | `list_tree(repo, ref, path, depth, limit)` | 获取仓库文件树，`path` 限定子目录，`depth` 限制目录深度，`limit` 限制条目数 |
 | `read_code(repo, path, ref, start_line, max_lines)` | 读取任意仓库任意文件，`ref` 指定分支/commit，`start_line`/`max_lines` 定位任意行范围 |
 | `download(repo, path, ref)` | 下载文件到 `/tmp/github-mcp/<owner>/<repo>/<仓库内路径>`，超过 1 MiB 自动回退 raw 端点 |
+| `grep(repo, path, pattern, ref, ignore_case, limit)` | 在单个文件内按正则逐行搜索，返回行号与整行内容，行号可直接用于 `read_code` |
 
 ## 环境变量
 

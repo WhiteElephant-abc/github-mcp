@@ -815,6 +815,89 @@ async def download(
     ) + notice
 
 
+@mcp.tool(structured_output=False)
+async def grep(
+    repo: Annotated[str, Field(description="仓库名，格式 owner/name，例如 'JetBrains/kotlin'")],
+    path: Annotated[str, Field(description="文件路径，例如 'libraries/stdlib/src/kotlin/Library.kt'")],
+    pattern: Annotated[str, Field(description="正则表达式，例如 'fun\\s+Any'")],
+    ref: Annotated[str | None, Field(description="分支、标签或 commit SHA。不传则使用仓库默认分支")] = None,
+    ignore_case: Annotated[bool, Field(description="是否忽略大小写，默认 false")] = False,
+    limit: Annotated[int, Field(description="最多返回的匹配行数，默认 50，最大 200")] = 50,
+) -> str:
+    """在仓库中的单个文件内搜索文本。
+
+    按行匹配正则表达式，返回匹配的行号和整行内容；行号可直接用于 read_code 的 start_line。"""
+    limit = max(1, min(int(limit), 200))
+    try:
+        regex = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
+    except re.error as e:
+        return f"grep 失败: 无效的正则表达式（{e}）"
+
+    async with _client() as client:
+        notice = await _archived_notice(client, repo)
+
+    try:
+        async with _client() as client:
+            url = f"{API_BASE}/repos/{repo}/contents/{quote(path, safe='/')}"
+            params = {"ref": ref} if ref else None
+            resp = await _get(client, url, params=params, headers=_headers())
+            if resp.status_code == 404:
+                info = await _get(client, f"{API_BASE}/repos/{repo}", headers=_headers())
+                if info.status_code == 404:
+                    suggest = await _repo_suggestions(client, repo)
+                    return f"grep 失败: 仓库不存在（{repo}）{suggest}"
+                if info.status_code != 200:
+                    return f"grep 失败: {_api_error(info)}"
+                params = {"ref": ref or info.json()["default_branch"]}
+                resp = await _get(client, url, params=params, headers=_headers())
+            if resp.status_code != 200:
+                return f"grep 失败: {_api_error(resp)}"
+
+            body = resp.json()
+            if isinstance(body, list):
+                return f"grep 失败: '{path}' 是目录而非文件"
+            sha = body.get("sha", "")
+            size = body.get("size", 0)
+            if body.get("encoding") == "base64":
+                data = base64.b64decode(body.get("content") or "")
+            else:
+                raw_ref = quote(ref, safe="/") if ref else "HEAD"
+                async with _client() as raw_client:
+                    raw = await _get(
+                        raw_client,
+                        f"{RAW_BASE}/{repo}/{raw_ref}/{quote(path, safe='/')}",
+                        headers=_headers(),
+                        timeout=max(TIMEOUT * 3, 60),
+                    )
+                if raw.status_code != 200:
+                    return f"grep 失败: 文件获取失败 (HTTP {raw.status_code})"
+                data = raw.content
+                sha = ""
+                size = len(data)
+    except Exception as e:
+        cause = f" cause={e.__cause__!r}" if e.__cause__ else ""
+        return f"grep 失败: API 服务不可用 ({type(e).__name__}: {e!r}{cause})"
+
+    if b"\x00" in data[:4096]:
+        return f"grep 失败: '{path}' 是二进制文件"
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    matches = [(i, line) for i, line in enumerate(lines, 1) if regex.search(line)]
+    if not matches:
+        return f"在 {repo} — {path} 中未找到匹配 '{pattern}' 的行。" + notice
+
+    shown = matches[:limit]
+    width = len(str(shown[-1][0]))
+    out = [
+        f"# {repo} — {path}（匹配 {len(matches)} 行，显示前 {len(shown)} 条）",
+        f"ref={ref or 'default'}  | 共 {len(lines)} 行  | sha={sha[:12] or 'N/A'}  | size={size}",
+        "",
+    ]
+    out.extend(f"{i:>{width}} | {line}" for i, line in shown)
+    if len(matches) > limit:
+        out.append(f"\n... 还有 {len(matches) - limit} 行匹配，可用 limit 调整")
+    return "\n".join(out) + notice
+
+
 if __name__ == "__main__":
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8000"))
